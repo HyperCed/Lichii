@@ -349,6 +349,9 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             [&](u64 address, NativeQmdScheduler::Descriptor& descriptor) {
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) return false;
                 memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
+                if (VideoCommon::ListMacroTrace::g_enabled) {
+                    VideoCommon::ListMacroTrace::NoteQmd(address, descriptor);
+                }
                 if (static u32 logged{}; (descriptor[53] & (1U << 23)) && logged < 8) {
                     ++logged;
                     LOG_INFO(HW_GPU, "Native QMD {:#x} releases: {:08x} | {:08x} | {:08x}", address,
@@ -1682,7 +1685,8 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         ListTrace::g_enabled
             ? ListTrace::BeginCall(ListTrace::Engine::Compute, static_cast<EngineInterface*>(this),
                                    method, macro.native_code, macro.native_code_generation, start,
-                                   fs.parameters, *macro.native_interpreter.active_dram)
+                                   fs.parameters, *macro.native_interpreter.active_dram,
+                                   fs.registers)
             : nullptr;
     const auto read = [&fs, trace](u32 address) {
         const u32 value = address < fs.registers.size() ? fs.registers[address] : 0U;
@@ -1706,8 +1710,12 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         macro.native_jit = std::make_shared<TuringMacroJit>();
     }
     macro.native_jit->Prepare(macro.native_code, macro.native_code_generation);
-    const auto result = macro.native_jit->Execute(
-        start, fs.parameters, std::span<u32>{*macro.native_interpreter.active_dram}, read, emit);
+    const auto result =
+        trace != nullptr && trace->data_ram
+            ? macro.native_interpreter.Execute(macro.native_code, start, fs.parameters, read, emit)
+            : macro.native_jit->Execute(start, fs.parameters,
+                                        std::span<u32>{*macro.native_interpreter.active_dram},
+                                        read, emit);
 #else
     const auto result =
         macro.native_interpreter.Execute(macro.native_code, start, fs.parameters, read, emit);
@@ -1718,7 +1726,8 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
                   start, result.consumed, result.error);
     }
     if (trace != nullptr) {
-        ListTrace::EndCall(*trace, false);
+        ListTrace::EndCall(*trace, false, macro.native_interpreter.data_ram_reads,
+                           macro.native_interpreter.data_ram_writes);
     }
     fs.parameters.clear();
 }

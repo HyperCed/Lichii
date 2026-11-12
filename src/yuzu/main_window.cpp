@@ -2076,6 +2076,39 @@ bool MainWindow::SelectAndSetCurrentUser(
     return true;
 }
 
+bool MainWindow::ConfirmLowRamBoot(const QString& filename,
+                                   const Service::AM::FrontendAppletParameters& params) {
+    const auto ram = Common::GetHostRam();
+    if (!UISettings::values.show_low_ram_warning.GetValue() ||
+        !Common::IsBelowSwitch2RamMinimum(ram) ||
+        !Core::FindSwitch2Program(
+            Core::GetGameFileFromPath(QtCommon::vfs, filename.toUtf8().constData()),
+            params.program_id, params.program_index)) {
+        return true;
+    }
+
+    QMessageBox box(QMessageBox::Warning, tr("Not enough RAM"),
+                    tr("This PC has %1 GB of RAM. Switch 2 games need at least 16 GB, and 32 GB "
+                       "is recommended.\n\nGames can crash, and can even freeze or crash the "
+                       "whole PC.\n\nThis setup isn't supported, so please don't open issues or "
+                       "ask for help about crashes on it.")
+                        .arg(static_cast<double>(ram.bytes) / 1_GiB, 0, 'g', 3),
+                    QMessageBox::NoButton, this);
+    QPushButton* const continue_button =
+        box.addButton(tr("Continue anyway"), QMessageBox::AcceptRole);
+    QPushButton* const cancel_button = box.addButton(tr("Cancel"), QMessageBox::RejectRole);
+    box.setDefaultButton(cancel_button);
+    box.setEscapeButton(cancel_button);
+    QCheckBox* const dont_show = new QCheckBox(tr("Don't show this again"), &box);
+    box.setCheckBox(dont_show);
+    box.exec();
+
+    if (dont_show->isChecked()) {
+        UISettings::values.show_low_ram_warning.SetValue(false);
+    }
+    return box.clickedButton() == continue_button;
+}
+
 void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletParameters params,
                           StartGameType type) {
 #ifdef LICHII_NX_TOOLS
@@ -2131,6 +2164,11 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     if (params.program_id == 0 ||
         params.program_id > static_cast<u64>(Service::AM::AppletProgramId::MaxProgramId)) {
         StoreRecentFile(filename); // Put the filename on top of the list
+    }
+
+    if (params.launch_type == Service::AM::LaunchType::FrontendInitiated &&
+        !ConfirmLowRamBoot(filename, params)) {
+        return;
     }
 
     // Save configurations
@@ -4604,7 +4642,11 @@ void MainWindow::OnGameListPrepareShaderWarm(u64 program_id, const std::string& 
         return;
     }
 
-    const auto path = std::filesystem::path{std::u8string{game_path.begin(), game_path.end()}};
+    auto path = std::filesystem::path{std::u8string{game_path.begin(), game_path.end()}};
+    // Loose dumps are listed by their exefs folder (FormatGameName); the loader opens its main.
+    if (std::error_code ec; std::filesystem::is_directory(path, ec)) {
+        path /= "main";
+    }
     shader_warm_dialog =
         new ShaderWarmDialog(*QtCommon::system, path, program_id, GameTitleName(game_path), this);
     connect(shader_warm_dialog, &QDialog::finished, shader_warm_dialog, &QObject::deleteLater);

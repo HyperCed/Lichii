@@ -49,6 +49,7 @@
 #include "core/hle/kernel/k_client_session.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/hle/kernel/k_system_resource.h"
 #include "core/hle/kernel/k_memory_manager.h"
 #include "core/hle/kernel/k_system_control.h"
@@ -1991,6 +1992,9 @@ private:
     void PresentClientBuffer(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         ++m_presents;
+        if (Kernel::Nx2ThreadStats::g_enabled) {
+            Kernel::Nx2ThreadStats::OnPresent(&ctx.GetThread());
+        }
         if (Common::DkbFrameTrace::Enabled()) {
             m_vsync->trace_present.store(m_presents, std::memory_order_relaxed);
         }

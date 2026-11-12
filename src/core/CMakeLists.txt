@@ -354,6 +354,8 @@ add_library(core STATIC
     hle/kernel/kernel.h
     hle/kernel/memory_types.h
     hle/kernel/message_buffer.h
+    hle/kernel/nx2_thread_stats.cpp
+    hle/kernel/nx2_thread_stats.h
     hle/kernel/physical_core.cpp
     hle/kernel/physical_core.h
     hle/kernel/slab_helpers.h

@@ -409,7 +409,8 @@ public:
     /// Takes CPU writes about to be applied one by one out of the GPU-written ranges first, so
     /// applying one doesn't download the GPU's copy over another (WriteMemory keeps the GPU data
     /// on the pages it writes).
-    void ClaimCpuWrites(std::span<const std::pair<DAddr, u64>> ranges);
+    template <typename Ranges>
+    void ClaimCpuWrites(const Ranges& ranges);
 
     /// Return true when there are uncommitted buffers to be downloaded
     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;

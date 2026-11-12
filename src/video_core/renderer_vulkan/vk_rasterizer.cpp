@@ -2763,10 +2763,16 @@ void RasterizerVulkan::InvalidateCachedWrites(
     };
     if (std::ranges::any_of(sequences, reaches_buffers)) {
         std::scoped_lock lock{buffer_cache.mutex};
+        boost::container::small_vector<std::pair<DAddr, std::size_t>, 16> applied;
         for (const auto& range : sequences) {
             if (reaches_buffers(range)) {
-                buffer_cache.WriteMemory(range.first, range.second, true, true);
+                applied.push_back(range);
             }
+        }
+        // As OnCacheInvalidations: out of the GPU-written ranges first.
+        buffer_cache.ClaimCpuWrites(applied);
+        for (const auto& [addr, size] : applied) {
+            buffer_cache.WriteMemory(addr, size, true, true);
         }
     }
     if (any(query_cache.page_filter)) {

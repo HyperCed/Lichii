@@ -300,6 +300,8 @@ private:
     void LoadAmiibo(const QString& filename);
 
     bool SelectAndSetCurrentUser(const Core::Frontend::ProfileSelectParameters& parameters);
+    bool ConfirmLowRamBoot(const QString& filename,
+                           const Service::AM::FrontendAppletParameters& params);
 
     /**
      * Stores the filename in the recently loaded files list.

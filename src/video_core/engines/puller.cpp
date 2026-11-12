@@ -136,6 +136,12 @@ AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcqui
             return AcquireCheck::MetByQueued;
         }
         VideoCommon::Count(stats.drain_queued);
+        if (VideoCommon::g_acquire_counting && !queued->known) {
+            VideoCommon::Count(stats.queued_unknown);
+            if (acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
+                VideoCommon::Count(stats.queued_unknown_met);
+            }
+        }
         return AcquireCheck::Drain;
     }
     return acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))
@@ -431,8 +437,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
         auto& stats = VideoCommon::g_acquire_stats;
-        if (const AcquireCheck without_drain = CheckWithoutDrain(dma_pusher, acquire);
-            without_drain == AcquireCheck::Met || without_drain == AcquireCheck::MetByQueued) {
+        const AcquireCheck without_drain = CheckWithoutDrain(dma_pusher, acquire);
+        if (without_drain == AcquireCheck::Met || without_drain == AcquireCheck::MetByQueued) {
             if (without_drain == AcquireCheck::MetByQueued) {
                 // What the front reads after the acquire waits for the work sent before the
                 // release (GpuSplit::NoteSync).
@@ -443,10 +449,17 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             VerifyWithoutDrain(dma_pusher, acquire, without_drain);
             return;
         }
+        const bool not_met = without_drain == AcquireCheck::NotMet;
+        if (not_met) {
+            VideoCommon::Count(stats.trigger_not_met);
+        }
         VideoCommon::Count(stats.drained);
         DrainBack();
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             return;
+        }
+        if (not_met) {
+            VideoCommon::Count(stats.trigger_not_met_twice);
         }
         // Registered before the fences run, so a release among them that meets the value counts
         // even if a later one overwrites it. The word in memory is watched for the guest CPU's

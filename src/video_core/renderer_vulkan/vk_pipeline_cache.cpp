@@ -184,6 +184,29 @@ Shader::AttributeType AttributeType(const FixedPipelineState& state, size_t inde
     return Shader::AttributeType::Disabled;
 }
 
+// Switch 2 geometry shaders may write all 32 generic outputs next to Position and Layer: 133
+// components where Vulkan devices allow 128 (maxGeometryOutputComponents). AMD's Windows driver
+// closed the emulator compiling such a shader at the Mario Tennis Fever match start. Drop the
+// outputs the fragment shader never reads; skipped where it can't tell (legacy, indexed, XFB) and
+// for passthrough shaders the host runs natively (no IR writes the outputs there).
+void PruneUnreadGeometryOutputs(Shader::IR::Program& geometry, const Shader::IR::Program& fragment,
+                                const GraphicsPipelineCacheKey& key, bool native_passthrough) {
+    const Shader::Info& fs{fragment.info};
+    Shader::VaryingState& stores{geometry.info.stores};
+    if (fragment.stage != Shader::Stage::Fragment || key.state.xfb_enabled ||
+        (geometry.is_geometry_passthrough && native_passthrough) || fs.loads_indexed_attributes ||
+        fs.loads.Legacy() || stores.Legacy()) {
+        return;
+    }
+    for (size_t index = 0; index < Shader::IR::NUM_GENERICS; ++index) {
+        if (!fs.loads.Generic(index)) {
+            for (size_t element = 0; element < 4; ++element) {
+                stores.Set(Shader::IR::Attribute::Generic0X + index * 4 + element, false);
+            }
+        }
+    }
+}
+
 Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> programs,
                                     const GraphicsPipelineCacheKey& key,
                                     const Shader::IR::Program& program,
@@ -1667,9 +1690,16 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
             file.read(magic.data(), magic.size())
                 .read(reinterpret_cast<char*>(&version), sizeof(version));
             constexpr std::array<char, 8> expected_magic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
-            if (magic != expected_magic || version != CACHE_VERSION) {
-                LOG_WARNING(Render_Vulkan, "Shader precache: {} is not a version {} file", path,
-                            CACHE_VERSION);
+            // The file holds environments only, which read the same in every compatible version:
+            // one from an older version is built again under this one (the marker carries it).
+            const auto& compatible = VideoCommon::CompatibleVulkanPipelineCacheVersions;
+            if (magic != expected_magic ||
+                (version != CACHE_VERSION &&
+                 std::ranges::find(compatible, version) == compatible.end())) {
+                LOG_WARNING(Render_Vulkan,
+                            "Shader precache: {} is a version {} file, not {} or a compatible "
+                            "one; pre-compile the game's shaders again",
+                            path, version, CACHE_VERSION);
                 throw std::runtime_error("wrong version");
             }
             while (file.tellg() != end) {
@@ -2593,6 +2623,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
         }
         ConvertLegacyToGeneric(program, runtime_info);
+        if (index == static_cast<size_t>(Maxwell::ShaderType::Geometry)) {
+            PruneUnreadGeometryOutputs(
+                program, programs[static_cast<size_t>(Maxwell::ShaderType::Pixel)], key,
+                device.IsNvGeometryShaderPassthroughSupported());
+        }
         // EDEN_NX2_MESH_EMULATION_DUMP=<dir>: write the emulation's vertex shader for spirv-val.
         // (Emitting the mesh program a second time here to dump its compute shader crashed the
         // build that followed, so only the vertex shader is written.)

@@ -61,7 +61,13 @@ struct Reads {
     explicit Reads(IR::IREmitter& ir)
         : pred{ir.GetPred(IR::Pred::P2)}, zero{ir.GetZFlag()}, sign{ir.GetSFlag()},
           carry{ir.GetCFlag()}, overflow{ir.GetOFlag()}, go_to{ir.GetGotoVariable(3)},
-          indirect{ir.GetIndirectBranchVariable()} {}
+          indirect{ir.GetIndirectBranchVariable()} {
+        // The pass drops identities nothing uses, so each read gets a use.
+        for (const IR::Value& value : {pred, zero, sign, carry, overflow, go_to}) {
+            static_cast<void>(ir.LogicalNot(IR::U1{value}));
+        }
+        static_cast<void>(ir.BitwiseNot(IR::U32{indirect}));
+    }
 };
 
 /// Runs the SSA pass over blocks given in program order, visited in reverse post order.
