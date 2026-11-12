@@ -23,6 +23,9 @@
 #ifdef HAS_NCE
 #include "core/arm/nce/arm_nce.h"
 #endif
+#ifdef HAS_HVF
+#include "core/arm/hvf/arm_hvf.h"
+#endif
 
 namespace Kernel {
 
@@ -1318,6 +1321,12 @@ void KProcess::InitializeInterfaces(KernelCore& kernel) {
     if (this->IsApplication() && Settings::IsNceEnabled()) {
         for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++)
             m_arm_interfaces[i] = std::make_unique<Core::ArmNce>(kernel.System(), true, i);
+    } else
+#endif
+#ifdef HAS_HVF
+    if (m_memory.GetHvfAddressSpace() != nullptr) {
+        for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++)
+            m_arm_interfaces[i] = std::make_unique<Core::ArmHvf>(kernel.System(), this, i);
     } else
 #endif
         if (this->Is64Bit()) {

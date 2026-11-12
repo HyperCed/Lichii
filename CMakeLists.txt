@@ -338,6 +338,12 @@ if (ARCHITECTURE_arm64 AND (ANDROID OR LINUX))
     add_compile_definitions(HAS_NCE=1)
 endif()
 
+# Hypervisor.framework CPU backend (Apple Silicon).
+if (ARCHITECTURE_arm64 AND APPLE AND NOT IOS)
+    set(HAS_HVF 1)
+    add_compile_definitions(HAS_HVF=1)
+endif()
+
 if (YUZU_ROOM)
     add_compile_definitions(YUZU_ROOM)
 endif()

@@ -34,7 +34,7 @@ ConfigureCpu::ConfigureCpu(const Core::System& system_,
     connect(backend_combobox, qOverload<int>(&QComboBox::currentIndexChanged), this,
             &ConfigureCpu::UpdateGroup);
 
-#ifdef HAS_NCE
+#if defined(HAS_NCE) || defined(HAS_HVF)
     ui->backend_group->setVisible(true);
 #endif
 }
@@ -93,7 +93,7 @@ void ConfigureCpu::Setup(const ConfigurationShared::Builder& builder) {
 
 void ConfigureCpu::UpdateGroup() {
     const u32 accuracy = accuracy_combobox->currentIndex();
-    const u32 backend = backend_combobox->currentIndex();
+    const u32 backend = backend_combobox->currentData().toUInt();
     // TODO(crueter): see if this works on NCE
     ui->unsafe_group->setVisible(accuracy == (u32)Settings::CpuAccuracy::Unsafe &&
                                  backend == (u32)Settings::CpuBackend::Dynarmic);

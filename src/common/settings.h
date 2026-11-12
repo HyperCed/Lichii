@@ -261,7 +261,9 @@ struct Values {
                                                     CpuBackend::Dynarmic,
 #endif
                                                     CpuBackend::Dynarmic,
-#ifdef HAS_NCE
+#if defined(HAS_HVF)
+                                                    CpuBackend::Hvf,
+#elif defined(HAS_NCE)
                                                     CpuBackend::Nce,
 #else
                                                     CpuBackend::Dynarmic,

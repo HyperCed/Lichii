@@ -36,6 +36,10 @@ namespace Tegra {
 class MemoryManager;
 }
 
+namespace Core::Hvf {
+class AddressSpace;
+}
+
 namespace Core::Memory {
 
 /// Counts unmapped reads on this host thread since the CPU callbacks last checked (debug aid).
@@ -83,6 +87,11 @@ public:
      * @param process The process to use the page table of.
      */
     void SetCurrentPageTable(Kernel::KProcess& process);
+
+#ifdef HAS_HVF
+    /// The guest translation tables of a process that runs under the hypervisor, else null.
+    Hvf::AddressSpace* GetHvfAddressSpace();
+#endif
 
     /**
      * Maps an allocated buffer onto a region of the emulated process address space.
