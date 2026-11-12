@@ -652,6 +652,15 @@ void Scheduler::AllocateWorkerCommandBuffer() {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
         .pInheritanceInfo = nullptr,
     });
+    // Uploads reordered here may overwrite what earlier submissions, still running, read.
+    static constexpr VkMemoryBarrier EARLIER_WORK_BARRIER{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+    };
+    current_upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, EARLIER_WORK_BARRIER);
     if (trace_query_pool && !trace_gpu_failed && (trace_gpu_pending || trace_gpu_sampling)) {
         TraceGpuSubmission();
     }
