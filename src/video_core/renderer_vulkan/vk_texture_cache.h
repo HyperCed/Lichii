@@ -7,6 +7,7 @@
 #pragma once
 
 #include <chrono>
+#include <source_location>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -159,7 +160,9 @@ public:
     [[nodiscard]] std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(ImageView& input,
                                                                               ImageView& output);
 
-    void CopyImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
+    /// `location`: who asked, for the GPU profile's render pass ends.
+    void CopyImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies,
+                   std::source_location location = std::source_location::current());
 
     void CopyImageMSAA(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
 
