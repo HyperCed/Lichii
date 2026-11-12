@@ -434,9 +434,11 @@ HaltReason ArmHvf::HandleDataAbort(Hvf::Vcpu& vcpu, u64 syndrome) {
     // Pages are protected while the GPU caches them, as with fastmem.
     if (access == Access::Denied && m_fault_repeats < 3) {
         if (!write) {
-            // The slow read path brings the GPU's data and disarms a read trap.
+            // The slow read path brings the GPU's data and disarms a read trap, unless it finds
+            // the data current already: the page is as readable then, and only its trap is left.
             (void)m_memory.Read8(address);
-            if (m_space.Query(address, false) == Access::Allowed) {
+            if (m_space.Query(address, false) == Access::Allowed ||
+                m_memory.GrantCachedPageRead(address)) {
                 return retry();
             }
         }

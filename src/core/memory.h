@@ -515,6 +515,10 @@ public:
 
     bool InvalidateNCE(Common::ProcessAddress vaddr, size_t size);
 
+    /// Makes a page the GPU caches readable once a slow-path read has brought its data, read
+    /// trap or not. False when the GPU doesn't cache the page.
+    bool GrantCachedPageRead(Common::ProcessAddress vaddr);
+
     bool InvalidateSeparateHeap(void* fault_address);
 
 private:
