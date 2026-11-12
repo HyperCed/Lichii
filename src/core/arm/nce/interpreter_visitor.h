@@ -105,7 +105,16 @@ private:
     const u64& m_pc;
 };
 
+/// Executes the load or store at pc through `memory`. Returns the next pc, or nothing when the
+/// instruction is not one of those.
+std::optional<u64> MatchAndExecuteOneInstruction(Core::Memory::Memory& memory,
+                                                 std::span<u64, 31> regs,
+                                                 std::span<u128, 32> fpsimd_regs, u64& sp,
+                                                 const u64& pc);
+
+#ifdef HAS_NCE
 std::optional<u64> MatchAndExecuteOneInstruction(Core::Memory::Memory& memory, mcontext_t* context,
                                                  fpsimd_context* fpsimd_context);
+#endif
 
 } // namespace Core

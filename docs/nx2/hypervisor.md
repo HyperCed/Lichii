@@ -24,7 +24,9 @@ Code is in `src/core/arm/hvf/`.
   trapped register) lands on an EL1 vector that leaves the guest with `hvc`; the guest is entered
   again with `eret`, optionally after a TLB flush.
 - **Faults.** A fault on a page the GPU caches is resolved like NCE does (flush or invalidate, then
-  retry). Any other invalid access is logged and its instruction skipped.
+  retry). Where the page must stay protected (GPU-written data the buffer cache keeps tracked),
+  the load or store is interpreted through `Memory`, as Dynarmic's slow path does. Any other
+  invalid access is logged and its instruction skipped.
 
 ## Costs and limits
 
