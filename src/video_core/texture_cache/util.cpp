@@ -939,15 +939,18 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
 }
 
 namespace {
-// One level of a single-layer 2D block-linear image of 1x1-texel blocks, laid out as
-// UnswizzleImage reads it: rows of blocks, each block one GOB wide and 2^block_height GOBs tall.
+// One level of a layer of a 2D block-linear image, laid out as UnswizzleImage reads it: rows of
+// blocks, each block one GOB wide and 2^block_height GOBs tall. Sizes are in the format's texel
+// blocks (texels for an uncompressed format) unless they say texels.
 struct BlockLinearLevel {
-    u32 offset;         ///< Into the image
-    u32 width;          ///< Texels
+    u32 offset;         ///< Into the layer
+    u32 width;
     u32 height;
+    u32 texel_width;    ///< Texels
+    u32 texel_height;
     u32 block_height;   ///< Log2 of the GOBs a block is tall
-    u32 block_texels;   ///< Texels across a block
-    u32 block_rows;     ///< Texel rows in a block
+    u32 block_texels;   ///< Texel blocks across a block
+    u32 block_rows;     ///< Rows of texel blocks in a block
     u32 block_bytes;
     u32 blocks_per_row;
 };
@@ -967,8 +970,10 @@ std::vector<BlockLinearLevel> BlockLinearLevels(const ImageInfo& info) {
         const u32 stride = Common::AlignUpLog2(num_tiles.width, stride_alignment) << bpp_log2;
         levels.push_back({
             .offset = offset,
-            .width = level_size.width,
-            .height = level_size.height,
+            .width = num_tiles.width,
+            .height = num_tiles.height,
+            .texel_width = level_size.width,
+            .texel_height = level_size.height,
             .block_height = block.height,
             .block_texels = GOB_SIZE_X >> bpp_log2,
             .block_rows = GOB_SIZE_Y << block.height,
@@ -988,13 +993,18 @@ struct RectBlocks {
     u32 num_blocks;
 };
 
-RectBlocks BlocksOf(const BlockLinearLevel& level, const LevelRect& rect) {
-    const u32 first_block = rect.x / level.block_texels;
+// `rect` is in texels, `texel_block` the format's texel block size.
+RectBlocks BlocksOf(const BlockLinearLevel& level, const LevelRect& rect, Extent2D texel_block) {
+    const u32 x = rect.x / texel_block.width;
+    const u32 y = rect.y / texel_block.height;
+    const u32 width = Common::DivCeil(rect.width, texel_block.width);
+    const u32 height = Common::DivCeil(rect.height, texel_block.height);
+    const u32 first_block = x / level.block_texels;
     return {
-        .first_row = rect.y / level.block_rows,
-        .last_row = (rect.y + rect.height - 1) / level.block_rows,
+        .first_row = y / level.block_rows,
+        .last_row = (y + height - 1) / level.block_rows,
         .first_block = first_block,
-        .num_blocks = (std::min)(Common::DivCeil(rect.width, level.block_texels),
+        .num_blocks = (std::min)(Common::DivCeil(width, level.block_texels),
                                  level.blocks_per_row - first_block),
     };
 }
@@ -1005,22 +1015,43 @@ u32 BlockRowTexelRows(const BlockLinearLevel& level, u32 row) {
 } // Anonymous namespace
 
 std::vector<LevelRect> SparseTileRects(const ImageInfo& info,
-                                       std::span<const std::pair<u64, u64>> ranges, u32 tile_width,
-                                       u32 tile_height, s32 tail_level) {
+                                       std::span<const std::pair<u64, u64>> image_ranges,
+                                       u32 tile_width, u32 tile_height, s32 tail_level) {
     std::vector<LevelRect> rects;
     const std::vector<BlockLinearLevel> levels = BlockLinearLevels(info);
-    const u64 image_end = CalculateLevelBytes(
+    const Extent2D texel_block = DefaultBlockSize(info.format);
+    tile_width /= texel_block.width;
+    tile_height /= texel_block.height;
+    const u64 layer_end = CalculateLevelBytes(
         CalculateLevelSizes(MakeLevelInfo(info), info.resources.levels), info.resources.levels);
+    const u32 num_layers = static_cast<u32>(info.resources.layers);
+    const u64 layer_stride = num_layers > 1 ? info.layer_stride : layer_end;
+    std::vector<std::pair<u64, u64>> layer_ranges;
+    for (u32 layer = 0; layer < num_layers; ++layer) {
+    // The ranges that reach this layer, from its start.
+    const u64 layer_begin = u64{layer} * layer_stride;
+    layer_ranges.clear();
+    for (const auto& [offset, size] : image_ranges) {
+        const u64 begin = (std::max)(offset, layer_begin);
+        const u64 end = (std::min)(offset + size, layer_begin + layer_end);
+        if (begin < end) {
+            layer_ranges.emplace_back(begin - layer_begin, end - begin);
+        }
+    }
+    if (layer_ranges.empty()) {
+        continue;
+    }
+    const std::span<const std::pair<u64, u64>> ranges{layer_ranges};
     for (s32 index = 0; index < static_cast<s32>(levels.size()); ++index) {
         const BlockLinearLevel& level = levels[index];
         const u64 level_end =
-            index + 1 < static_cast<s32>(levels.size()) ? levels[index + 1].offset : image_end;
+            index + 1 < static_cast<s32>(levels.size()) ? levels[index + 1].offset : layer_end;
         const auto overlaps = [&](const std::pair<u64, u64>& range) {
             return range.first < level_end && range.first + range.second > level.offset;
         };
         if (index >= tail_level) {
             if (std::ranges::any_of(ranges, overlaps)) {
-                rects.push_back({index, 0, 0, level.width, level.height});
+                rects.push_back({index, 0, 0, level.texel_width, level.texel_height, layer});
             }
             continue;
         }
@@ -1063,17 +1094,20 @@ std::vector<LevelRect> SparseTileRects(const ImageInfo& info,
                 while (tx < tiles_x && touched[size_t{ty} * tiles_x + tx]) {
                     ++tx;
                 }
-                const u32 x = first_tile * tile_width;
-                const u32 y = ty * tile_height;
+                const u32 x = first_tile * tile_width * texel_block.width;
+                const u32 y = ty * tile_height * texel_block.height;
                 rects.push_back({
                     .level = index,
                     .x = x,
                     .y = y,
-                    .width = (std::min)(tx * tile_width, level.width) - x,
-                    .height = (std::min)(y + tile_height, level.height) - y,
+                    .width = (std::min)(tx * tile_width * texel_block.width, level.texel_width) - x,
+                    .height = (std::min)(y + tile_height * texel_block.height, level.texel_height) -
+                              y,
+                    .layer = layer,
                 });
             }
         }
+    }
     }
     return rects;
 }
@@ -1081,10 +1115,11 @@ std::vector<LevelRect> SparseTileRects(const ImageInfo& info,
 size_t UnswizzledRectsBytes(const ImageInfo& info, std::span<const LevelRect> rects) {
     const std::vector<BlockLinearLevel> levels = BlockLinearLevels(info);
     const u32 bpp_log2 = BytesPerBlockLog2(info.format);
+    const Extent2D texel_block = DefaultBlockSize(info.format);
     size_t bytes = 0;
     for (const LevelRect& rect : rects) {
         const BlockLinearLevel& level = levels[rect.level];
-        const RectBlocks blocks = BlocksOf(level, rect);
+        const RectBlocks blocks = BlocksOf(level, rect, texel_block);
         for (u32 row = blocks.first_row; row <= blocks.last_row; ++row) {
             bytes += (size_t{blocks.num_blocks * level.block_texels} << bpp_log2) *
                      BlockRowTexelRows(level, row);
@@ -1099,19 +1134,21 @@ std::vector<BufferImageCopy> UnswizzleImageRects(Tegra::MemoryManager& gpu_memor
                                                  std::span<u8> output) {
     const std::vector<BlockLinearLevel> levels = BlockLinearLevels(info);
     const u32 bpp_log2 = BytesPerBlockLog2(info.format);
+    const Extent2D texel_block = DefaultBlockSize(info.format);
+    const u64 layer_stride = info.resources.layers > 1 ? info.layer_stride : 0;
     std::vector<BufferImageCopy> copies;
     std::vector<u8> swizzled;
     size_t output_offset = 0;
     for (const LevelRect& rect : rects) {
         const BlockLinearLevel& level = levels[rect.level];
-        const RectBlocks blocks = BlocksOf(level, rect);
+        const RectBlocks blocks = BlocksOf(level, rect, texel_block);
         const u32 width = blocks.num_blocks * level.block_texels;
         const size_t row_bytes = size_t{blocks.num_blocks} * level.block_bytes;
         for (u32 row = blocks.first_row; row <= blocks.last_row; ++row) {
             // A row of whole blocks is laid out like an image of that width on its own.
             const u32 texel_rows = BlockRowTexelRows(level, row);
             const size_t bytes = (size_t{width} << bpp_log2) * texel_rows;
-            const GPUVAddr row_addr = gpu_addr + level.offset +
+            const GPUVAddr row_addr = gpu_addr + rect.layer * layer_stride + level.offset +
                                       u64{row} * level.blocks_per_row * level.block_bytes +
                                       u64{blocks.first_block} * level.block_bytes;
             swizzled.assign(row_bytes, 0);
@@ -1119,22 +1156,29 @@ std::vector<BufferImageCopy> UnswizzleImageRects(Tegra::MemoryManager& gpu_memor
             UnswizzleTexture(output.subspan(output_offset, bytes), swizzled, 1U << bpp_log2, width,
                              texel_rows, 1, level.block_height, 0, 0,
                              gpu_memory.UsesNativeTiling());
+            // In texel blocks, then to texels for the copy.
             const u32 row_y = row * level.block_rows;
-            const u32 y0 = (std::max)(rect.y, row_y);
-            const u32 y1 = (std::min)(rect.y + rect.height, row_y + texel_rows);
+            const u32 rect_y = rect.y / texel_block.height;
+            const u32 rect_rows = Common::DivCeil(rect.height, texel_block.height);
+            const u32 y0 = (std::max)(rect_y, row_y);
+            const u32 y1 = (std::min)(rect_y + rect_rows, row_y + texel_rows);
             copies.push_back(BufferImageCopy{
                 .buffer_offset = output_offset + ((size_t{y0 - row_y} * width) << bpp_log2),
                 .buffer_size = bytes,
-                .buffer_row_length = width,
-                .buffer_image_height = texel_rows,
+                .buffer_row_length = width * texel_block.width,
+                .buffer_image_height = texel_rows * texel_block.height,
                 .image_subresource =
                     {
                         .base_level = rect.level,
-                        .base_layer = 0,
+                        .base_layer = static_cast<s32>(rect.layer),
                         .num_layers = 1,
                     },
-                .image_offset = {static_cast<s32>(rect.x), static_cast<s32>(y0), 0},
-                .image_extent = {rect.width, y1 - y0, 1},
+                .image_offset = {static_cast<s32>(rect.x),
+                                 static_cast<s32>(y0 * texel_block.height), 0},
+                .image_extent = {rect.width,
+                                 (std::min)(y1 * texel_block.height, level.texel_height) -
+                                     y0 * texel_block.height,
+                                 1},
             });
             output_offset += bytes;
         }

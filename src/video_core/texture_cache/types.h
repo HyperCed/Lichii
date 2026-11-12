@@ -132,13 +132,14 @@ struct ImageCopy {
     Extent3D extent;
 };
 
-/// A rectangle of one mip level, in texels.
+/// A rectangle of one mip level of one layer, in texels.
 struct LevelRect {
     s32 level;
     u32 x;
     u32 y;
     u32 width;
     u32 height;
+    u32 layer = 0;
 };
 
 struct BufferImageCopy {

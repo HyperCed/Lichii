@@ -405,6 +405,32 @@ HaltReason ArmHvf::HandleDataAbort(Hvf::Vcpu& vcpu, u64 syndrome) {
         m_fault_repeats = 0;
     }
 
+    auto& page_table = m_process->GetPageTable().GetBasePageTable();
+    const u64 page_address = address & ~Memory::YUZU_PAGEMASK;
+    if (access == Access::Denied &&
+        std::as_const(page_table.GetImpl().entries)[address >> Memory::YUZU_PAGEBITS].Type() ==
+            Common::PageType::Memory) {
+        // The GPU no longer tracks the page, yet it kept a protection (a read trap disarmed after
+        // the page left the cache leaves it read-only). Dynarmic's slow path accesses such pages
+        // freely; give the page the permissions the kernel has for it.
+        Kernel::KMemoryInfo info{};
+        Kernel::Svc::PageInfo page_info{};
+        if (page_table.QueryInfo(&info, &page_info, address).IsSuccess()) {
+            Common::MemoryPermission perms{};
+            if (True(info.GetPermission() & Kernel::KMemoryPermission::UserRead)) {
+                perms |= Common::MemoryPermission::Read;
+            }
+            if (True(info.GetPermission() & Kernel::KMemoryPermission::UserWrite)) {
+                perms |= Common::MemoryPermission::Write;
+            }
+            if (True(perms & (write ? Common::MemoryPermission::Write
+                                    : Common::MemoryPermission::Read))) {
+                m_space.Protect(page_address, Memory::YUZU_PAGESIZE, perms);
+                return retry();
+            }
+        }
+    }
+
     // Pages are protected while the GPU caches them, as with fastmem.
     if (access == Access::Denied && m_fault_repeats < 3) {
         if (!write) {
@@ -414,8 +440,7 @@ HaltReason ArmHvf::HandleDataAbort(Hvf::Vcpu& vcpu, u64 syndrome) {
                 return retry();
             }
         }
-        const u64 page = address & ~Memory::YUZU_PAGEMASK;
-        if (m_memory.InvalidateNCE(page, Memory::YUZU_PAGESIZE)) {
+        if (m_memory.InvalidateNCE(page_address, Memory::YUZU_PAGESIZE)) {
             return retry();
         }
     }
@@ -430,7 +455,6 @@ HaltReason ArmHvf::HandleDataAbort(Hvf::Vcpu& vcpu, u64 syndrome) {
         const char* const guest_tables = access == Access::Unmapped  ? "absent"
                                          : readable == Access::Allowed ? "read-only"
                                                                        : "no access";
-        auto& page_table = m_process->GetPageTable().GetBasePageTable();
         const bool in_range = address < (1ULL << Hvf::AddressSpaceBits);
         const auto page_type = in_range ? std::as_const(page_table.GetImpl().entries)
                                               [address >> Memory::YUZU_PAGEBITS].Type()

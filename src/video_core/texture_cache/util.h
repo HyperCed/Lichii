@@ -108,9 +108,10 @@ void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan&
     std::span<const u8> input, std::span<u8> output,
     Tegra::Texture::UnswizzleWorker* worker = nullptr);
 
-/// For a single-layer 2D block-linear image of 1x1-texel blocks: the host sparse blocks
-/// (tile_width x tile_height texels) that the guest byte ranges (offset, size) touch, merged into
-/// runs along x. Levels from tail_level on (the host's mip tail) come whole.
+/// For a 2D block-linear image: the host sparse blocks (tile_width x tile_height texels, a
+/// whole number of the format's texel blocks) that the guest byte ranges (offset, size) touch,
+/// by layer and merged into runs along x. Levels from tail_level on (the host's mip tail) come
+/// whole.
 [[nodiscard]] std::vector<LevelRect> SparseTileRects(const ImageInfo& info,
                                                      std::span<const std::pair<u64, u64>> ranges,
                                                      u32 tile_width, u32 tile_height,
@@ -119,8 +120,8 @@ void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan&
 /// Bytes UnswizzleImageRects writes for `rects`.
 [[nodiscard]] size_t UnswizzledRectsBytes(const ImageInfo& info, std::span<const LevelRect> rects);
 
-/// Unswizzles `rects` (from SparseTileRects: on GOB columns) of a single-layer 2D block-linear
-/// image into output, reading only the guest blocks under them.
+/// Unswizzles `rects` (from SparseTileRects: on GOB columns) of a 2D block-linear image into
+/// output, reading only the guest blocks under them.
 [[nodiscard]] std::vector<BufferImageCopy> UnswizzleImageRects(Tegra::MemoryManager& gpu_memory,
                                                                GPUVAddr gpu_addr,
                                                                const ImageInfo& info,

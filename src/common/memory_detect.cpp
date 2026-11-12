@@ -18,6 +18,10 @@
 #endif
 #endif
 
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
+
 #ifdef __linux__
 #include <algorithm>
 #include <cstdlib>
@@ -113,14 +117,25 @@ ProcessMemoryUsage GetProcessMemoryUsage() {
     return usage;
 }
 
-std::optional<u64> GetSystemCommitRoom() {
+std::optional<s64> GetSystemCommitRoom() {
 #ifdef _WIN32
     PERFORMANCE_INFORMATION performance{};
     performance.cb = sizeof(performance);
     if (GetPerformanceInfo(&performance, sizeof(performance))) {
         const u64 limit = performance.CommitLimit;
         const u64 committed = performance.CommitTotal;
-        return (committed < limit ? limit - committed : 0) * performance.PageSize;
+        return static_cast<s64>((committed < limit ? limit - committed : 0) * performance.PageSize);
+    }
+#elif defined(__APPLE__)
+    // Device memory is the system's RAM here, and what does not fit is swapped rather than
+    // refused: the room is the RAM this process does not hold (its footprint counts the device
+    // memory it owns), negative once it holds more than there is.
+    task_vm_info_data_t info{};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) ==
+        KERN_SUCCESS) {
+        return static_cast<s64>(GetMemInfo().TotalPhysicalMemory) -
+               static_cast<s64>(info.phys_footprint);
     }
 #endif
     return std::nullopt;
