@@ -2606,7 +2606,8 @@ bool TextureCacheRuntime::IsFormatScalable(PixelFormat format) {
 }
 
 void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
-                                    std::span<const VideoCommon::ImageCopy> copies) {
+                                    std::span<const VideoCommon::ImageCopy> copies,
+                                    std::source_location location) {
     boost::container::small_vector<VideoCommon::ImageCopy, 16> host_copies;
     copies = HostImageCopies(dst, src, copies, host_copies);
     if (copies.empty())
@@ -2641,7 +2642,7 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
     });
     const VkImage dst_image = dst.Handle();
     const VkImage src_image = src.Handle();
-    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.RequestOutsideRenderPassOperationContext(location);
     scheduler.Record([dst_image, src_image, aspect_mask, vk_copies](vk::CommandBuffer cmdbuf) {
         RangedBarrierRange dst_range;
         RangedBarrierRange src_range;

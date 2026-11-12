@@ -4388,7 +4388,8 @@ void TextureCache<P>::PrepareImageView(ImageViewId image_view_id, bool is_modifi
 }
 
 template <class P>
-void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<ImageCopy> copies) {
+void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<ImageCopy> copies,
+                                std::source_location location) {
     Image& dst = slot_images[dst_id];
     Image& src = slot_images[src_id];
     if (True(dst.flags & ImageFlagBits::UnwrittenSparse) ||
@@ -4426,7 +4427,7 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
                 return runtime.EmulateCopyImage(dst, src, copies);
             }
         }
-        return runtime.CopyImage(dst, src, copies);
+        return runtime.CopyImage(dst, src, copies, location);
     }
     UNIMPLEMENTED_IF(dst.info.type != ImageType::e2D);
     UNIMPLEMENTED_IF(src.info.type != ImageType::e2D);
