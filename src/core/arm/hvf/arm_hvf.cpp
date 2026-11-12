@@ -100,6 +100,62 @@ bool InterpretAccess(const Hvf::Vcpu& vcpu, Memory::Memory& memory) {
         SetSys(vcpu, HV_SYS_REG_ELR_EL1, GetSys(vcpu, HV_SYS_REG_ELR_EL1) + 4);
         return true;
     }
+    // ST1/LD1 of one vector element (single structure), which the interpreter lacks.
+    if (const u32 instruction = memory.Read32(GetSys(vcpu, HV_SYS_REG_ELR_EL1));
+        (instruction & 0xBF000000) == 0x0D000000) {
+        const bool post_index = (instruction & (1U << 23)) != 0;
+        const bool load = (instruction & (1U << 22)) != 0;
+        const bool pair = (instruction & (1U << 21)) != 0; // ST2/LD2 and above
+        const u32 rm = (instruction >> 16) & 0x1F;
+        const u32 opcode = (instruction >> 13) & 0x7;
+        const u32 s_bit = (instruction >> 12) & 1;
+        const u32 size = (instruction >> 10) & 0x3;
+        const u32 rn = (instruction >> 5) & 0x1F;
+        const u32 rt = instruction & 0x1F;
+        const u32 q = (instruction >> 30) & 1;
+        u32 scale = opcode >> 1;
+        u32 index = (q << 3) | (s_bit << 2) | size;
+        bool valid = !pair && (opcode & 1) == 0 && scale != 3 && (post_index || rm == 0);
+        if (scale == 1) {
+            valid = valid && (size & 1) == 0;
+            index >>= 1;
+        } else if (scale == 2) {
+            if ((size & 1) == 0) {
+                valid = valid && (size & 2) == 0;
+                index >>= 2;
+            } else {
+                valid = valid && s_bit == 0 && size == 1;
+                index = q;
+                scale = 3;
+            }
+        }
+        if (valid) {
+            const u32 bytes = 1U << scale;
+            const hv_simd_fp_reg_t vt = static_cast<hv_simd_fp_reg_t>(HV_SIMD_FP_REG_Q0 + rt);
+            const u64 address = rn == 31 ? GetSys(vcpu, HV_SYS_REG_SP_EL0)
+                                         : GetReg(vcpu, static_cast<hv_reg_t>(HV_REG_X0 + rn));
+            hv_simd_fp_uchar16_t value;
+            Check(hv_vcpu_get_simd_fp_reg(vcpu.id, vt, &value));
+            u8* const element = reinterpret_cast<u8*>(&value) + index * bytes;
+            if (load) {
+                memory.ReadBlock(address, element, bytes);
+                Check(hv_vcpu_set_simd_fp_reg(vcpu.id, vt, value));
+            } else {
+                memory.WriteBlock(address, element, bytes);
+            }
+            if (post_index) {
+                const u64 offset =
+                    rm == 31 ? bytes : GetReg(vcpu, static_cast<hv_reg_t>(HV_REG_X0 + rm));
+                if (rn == 31) {
+                    SetSys(vcpu, HV_SYS_REG_SP_EL0, address + offset);
+                } else {
+                    SetReg(vcpu, static_cast<hv_reg_t>(HV_REG_X0 + rn), address + offset);
+                }
+            }
+            SetSys(vcpu, HV_SYS_REG_ELR_EL1, GetSys(vcpu, HV_SYS_REG_ELR_EL1) + 4);
+            return true;
+        }
+    }
     std::array<u64, 31> regs;
     std::array<u128, 32> vregs;
     for (size_t i = 0; i < regs.size(); ++i) {
