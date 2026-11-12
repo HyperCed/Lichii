@@ -311,7 +311,9 @@ bool WallClock::IsNative() const {
 u64 WallClock::NsToTicks(std::chrono::nanoseconds ns) const {
     return ns.count() * rdtsc_ns_integer + MultiplyHigh(ns.count(), rdtsc_ns_factor);
 }
-#elif defined(HAS_NCE)
+// Apple silicon: steady_clock goes through clock_gettime and mach_timebase_info (~27% of the GPU
+// back thread with the GPU profile on), the counter register is readable as on Linux.
+#elif defined(HAS_NCE) || (defined(__APPLE__) && defined(__aarch64__))
 namespace {
 [[nodiscard]] Common::WallClock::FactorType GetFixedPointFactor(u64 num, u64 den) noexcept {
     return (Common::WallClock::FactorType(num) << 64) / den;
@@ -448,7 +450,7 @@ WallClock g_wall_clock = [] {
 #if defined(ARCHITECTURE_x86_64)
     auto const& caps = Common::g_cpu_caps;
     return WallClock(caps.invariant_tsc && caps.tsc_frequency > std::nano::den, caps.tsc_frequency);
-#elif defined(HAS_NCE)
+#elif defined(HAS_NCE) || (defined(__APPLE__) && defined(__aarch64__))
     return WallClock(false, 1);
 #else
     return WallClock(true, 1);
