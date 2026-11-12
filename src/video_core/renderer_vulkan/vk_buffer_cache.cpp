@@ -135,9 +135,21 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
     }
 }
 
+// Usage is tracked for the submission being recorded: an upload into a region only earlier
+// submissions use can still go to the upload command buffer, which waits for them (see
+// Scheduler::AllocateWorkerCommandBuffer). Kept until the GPU was done with them, buffers used
+// every frame never let uploads be reordered, and each one ended the render pass.
 void Buffer::MarkUsage(u64 offset, u64 size) noexcept {
+    const u64 tick = scheduler->CurrentTick();
+    if (tick != last_usage_tick) {
+        tracker.Reset();
+    }
     tracker.Track(offset, size);
-    last_usage_tick = scheduler->CurrentTick();
+    last_usage_tick = tick;
+}
+
+bool Buffer::IsRegionUsed(u64 offset, u64 size) const noexcept {
+    return last_usage_tick == scheduler->CurrentTick() && tracker.IsUsed(offset, size);
 }
 
 VkBufferView Buffer::View(u32 offset, u32 size, VideoCore::Surface::PixelFormat format) {
