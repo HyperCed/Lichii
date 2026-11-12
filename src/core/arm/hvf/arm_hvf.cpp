@@ -16,6 +16,7 @@
 #include "common/settings.h"
 #include "core/arm/hvf/arm_hvf.h"
 #include "core/arm/hvf/hvf_vm.h"
+#include "core/arm/nce/interpreter_visitor.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/device_memory.h"
@@ -82,6 +83,40 @@ void EnterKernel(const Hvf::Vcpu& vcpu, u64 pc, u64 pstate) {
     SetSys(vcpu, HV_SYS_REG_SPSR_EL1, pstate);
     SetReg(vcpu, HV_REG_PC, Hvf::ReturnStub);
     SetReg(vcpu, HV_REG_CPSR, PstateEl1h);
+}
+
+// Runs the faulting load or store through the emulator's memory, as Dynarmic's slow path does:
+// for a page that must stay protected. False when the instruction is neither.
+bool InterpretAccess(const Hvf::Vcpu& vcpu, Memory::Memory& memory) {
+    std::array<u64, 31> regs;
+    std::array<u128, 32> vregs;
+    for (size_t i = 0; i < regs.size(); ++i) {
+        regs[i] = GetReg(vcpu, static_cast<hv_reg_t>(HV_REG_X0 + i));
+    }
+    for (size_t i = 0; i < vregs.size(); ++i) {
+        hv_simd_fp_uchar16_t value;
+        Check(hv_vcpu_get_simd_fp_reg(vcpu.id, static_cast<hv_simd_fp_reg_t>(HV_SIMD_FP_REG_Q0 + i),
+                                      &value));
+        std::memcpy(&vregs[i], &value, sizeof(value));
+    }
+    u64 sp = GetSys(vcpu, HV_SYS_REG_SP_EL0);
+    const u64 pc = GetSys(vcpu, HV_SYS_REG_ELR_EL1);
+    const std::optional<u64> next = MatchAndExecuteOneInstruction(memory, regs, vregs, sp, pc);
+    if (!next) {
+        return false;
+    }
+    for (size_t i = 0; i < regs.size(); ++i) {
+        SetReg(vcpu, static_cast<hv_reg_t>(HV_REG_X0 + i), regs[i]);
+    }
+    for (size_t i = 0; i < vregs.size(); ++i) {
+        hv_simd_fp_uchar16_t value;
+        std::memcpy(&value, &vregs[i], sizeof(value));
+        Check(hv_vcpu_set_simd_fp_reg(vcpu.id, static_cast<hv_simd_fp_reg_t>(HV_SIMD_FP_REG_Q0 + i),
+                                      value));
+    }
+    SetSys(vcpu, HV_SYS_REG_SP_EL0, sp);
+    SetSys(vcpu, HV_SYS_REG_ELR_EL1, *next);
+    return true;
 }
 
 void SkipInstruction(const Hvf::Vcpu& vcpu) {
@@ -442,9 +477,19 @@ HaltReason ArmHvf::HandleDataAbort(Hvf::Vcpu& vcpu, u64 syndrome) {
                 return retry();
             }
         }
-        if (m_memory.InvalidateNCE(page_address, Memory::YUZU_PAGESIZE)) {
+        if (m_memory.InvalidateNCE(page_address, Memory::YUZU_PAGESIZE) &&
+            m_space.Query(address, write) == Access::Allowed) {
             return retry();
         }
+    }
+    // The page stays protected (the GPU still tracks it): the access goes through the emulator's
+    // memory instead.
+    if (access == Access::Denied &&
+        std::as_const(page_table.GetImpl().entries)[address >> Memory::YUZU_PAGEBITS].Type() ==
+            Common::PageType::RasterizerCachedMemory &&
+        InterpretAccess(vcpu, m_memory)) {
+        m_fault_repeats = 0;
+        return {};
     }
 
     // Skip the instruction: this lets games continue where they would otherwise crash.

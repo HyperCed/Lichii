@@ -1295,6 +1295,13 @@ if (HAS_NCE)
 endif()
 
 if (HAS_HVF)
+    if (NOT HAS_NCE)
+        # Loads and stores the hypervisor can't run in the guest are interpreted.
+        target_sources(core PRIVATE
+            arm/nce/interpreter_visitor.cpp
+            arm/nce/interpreter_visitor.h
+            arm/nce/visitor_base.h)
+    endif()
     target_sources(core PRIVATE
         arm/hvf/arm_hvf.cpp
         arm/hvf/arm_hvf.h
