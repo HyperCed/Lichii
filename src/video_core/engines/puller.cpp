@@ -149,6 +149,44 @@ AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcqui
                : AcquireCheck::NotMet;
 }
 
+// Registers the channel's acquire with the waiters, so a release the back runs latches it, even if
+// a later one overwrites the word. The word in memory is watched for the guest CPU's stores
+// (Nx2SemaphoreWaiters::WordStored).
+void AddWaiter(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire, const void* owner) {
+    u32* word = reinterpret_cast<u32*>(dma_pusher.memory_manager.GetPointer(acquire.address));
+    if (reinterpret_cast<uintptr_t>(word) % alignof(u32) != 0) {
+        word = nullptr;
+    }
+    if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+        device &&
+        !Nx2SemaphoreWaiters::Get().Add(owner, *device, acquire.value, acquire.operation, word)) {
+        if (static std::atomic<u32> full{}; full.fetch_add(1) < 8) {
+            LOG_ERROR(HW_GPU, "Channel {} waits on semaphore {:#x} unlatched: {} channels wait",
+                      dma_pusher.channel_state.bind_id, acquire.address,
+                      Nx2SemaphoreWaiters::MaxWaiters);
+        }
+    }
+}
+
+// An acquire suspended without a drain waits as it did in that drain until the back ran
+// everything sent before it: that work may still release the word unseen (a QMD release, a fenced
+// report), and lists submitted meanwhile keep their submit-time copies. If it still waits then,
+// the channel counts as suspended (DmaPusher::suspensions) and sends the fence work, where the
+// drain path did both after its drain; a plain Defer, so the front parses on meanwhile. Port of
+// MaybeReleaseFences from jpkto's 188baa1448 (#1161).
+void WaitPastBack(DmaPusher& dma_pusher, Puller::PendingAcquire& acquire) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (acquire.waits_past_back || (split.Active() && !split.Ran(acquire.sent_at))) {
+        return;
+    }
+    acquire.waits_past_back = true;
+    OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+    // Polls send the back nothing else: it could sleep with these few words unpublished.
+    split.Publish();
+    dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
+}
+
 // EDEN_NX2_ACQUIRE_VERIFY=1: drains anyway and counts where the word after the drain disagrees
 // with what CheckWithoutDrain decided.
 void VerifyWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
@@ -226,6 +264,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
             VideoCommon::Count(stats.latched);
             return true;
         }
+        WaitPastBack(dma_pusher, *pending_acquire);
         const auto now = std::chrono::steady_clock::now();
         if (now - pending_acquire->last_drain < std::chrono::milliseconds{1}) {
             VideoCommon::Count(stats.polls);
@@ -286,6 +325,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 8),
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 12));
     }
+    WaitPastBack(dma_pusher, *pending_acquire);
     return false;
 }
 
@@ -293,12 +333,19 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     if (!CanResumeAcquire(dma_pusher)) {
         return false;
     }
-    // Only a resume from a suspension counts: DmaPusher::Step calls this before every entry, and
-    // counting those made the count odd ("suspended") at random, so submit-time snapshots were
-    // thrown away for about half of all entries (CommandList::snapshot_suspensions).
+    // Only a resume from a counted suspension counts: DmaPusher::Step calls this before every
+    // entry, and counting those made the count odd ("suspended") at random, so submit-time
+    // snapshots were thrown away for about half of all entries (CommandList::snapshot_suspensions).
+    // An acquire met before the back ran the work before it never counted (WaitPastBack); what
+    // the front reads after it waits for that work instead (GpuSplit::NoteSync), as the drain it
+    // replaces did.
     if (pending_acquire) {
+        if (pending_acquire->waits_past_back) {
+            dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+        } else if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+            split.NoteSyncAt(pending_acquire->sent_at, pending_acquire->writers_before);
+        }
         pending_acquire.reset();
-        dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
         Nx2SemaphoreWaiters::Get().Remove(this);
     }
     return true;
@@ -453,6 +500,30 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         if (not_met) {
             VideoCommon::Count(stats.trigger_not_met);
         }
+        if (not_met) {
+            // Nothing the front sent to the word meets it, so only a release it can't see does:
+            // one in the work queued for the back, which latches the waiter and wakes this thread
+            // (Nx2SemaphoreWaiters::OnWrite, Nx2PendingWake), or a store by the guest CPU. The
+            // channel waits for it suspended, not in a drain, and the front parses the others
+            // meanwhile (as in jpkto's 188baa1448, #1161). Registered before the second look, so a
+            // release that lands in between counts.
+            VideoCommon::Count(stats.suspended);
+            auto& waiters = Nx2SemaphoreWaiters::Get();
+            AddWaiter(dma_pusher, acquire, this);
+            const u32 guest = dma_pusher.memory_manager.Read<u32>(acquire.address);
+            const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+            if (waiters.Latched(this) ||
+                acquire.Matches(device ? Nx2MirrorShadow::Get().Read(*device, guest).value_or(guest)
+                                       : guest)) {
+                waiters.Remove(this);
+                return;
+            }
+            acquire.sent_at = VideoCommon::GpuSplit::Get().Position();
+            acquire.writers_before = VideoCommon::GpuSplit::Get().LastWriterPosition();
+            pending_acquire = acquire;
+            WaitPastBack(dma_pusher, *pending_acquire);
+            return;
+        }
         VideoCommon::Count(stats.drained);
         DrainBack();
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
@@ -461,24 +532,12 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         if (not_met) {
             VideoCommon::Count(stats.trigger_not_met_twice);
         }
-        // Registered before the fences run, so a release among them that meets the value counts
-        // even if a later one overwrites it. The word in memory is watched for the guest CPU's
-        // stores (Nx2SemaphoreWaiters::WordStored).
+        // Registered before the fences run, so a release among them that meets the value counts.
         auto& waiters = Nx2SemaphoreWaiters::Get();
-        u32* word = reinterpret_cast<u32*>(dma_pusher.memory_manager.GetPointer(acquire.address));
-        if (reinterpret_cast<uintptr_t>(word) % alignof(u32) != 0) {
-            word = nullptr;
-        }
-        if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
-            device && !waiters.Add(this, *device, acquire.value, acquire.operation, word)) {
-            if (static std::atomic<u32> full{}; full.fetch_add(1) < 8) {
-                LOG_ERROR(HW_GPU, "Channel {} waits on semaphore {:#x} unlatched: {} channels wait",
-                          dma_pusher.channel_state.bind_id, acquire.address,
-                          Nx2SemaphoreWaiters::MaxWaiters);
-            }
-        }
+        AddWaiter(dma_pusher, acquire, this);
         ReleaseFences(dma_pusher);
         if (!waiters.Latched(this) && !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+            acquire.waits_past_back = true;
             pending_acquire = acquire;
             dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);

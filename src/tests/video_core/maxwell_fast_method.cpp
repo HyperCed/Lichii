@@ -7,6 +7,7 @@
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <future>
 #include <memory>
 #include <random>
 #include <span>
@@ -18,17 +19,21 @@
 
 #include "common/page_table.h"
 #include "common/scope_exit.h"
+#include "common/settings.h"
 #include "core/core.h"
 #include "core/device_memory.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/memory.h"
 #include "tests/core/system_test_context.h"
+#include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/dma_pusher.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/rasterizer_interface.h"
@@ -96,6 +101,10 @@ struct GpuSplitTestAccess {
     static u64 WritesTarget(const GpuSplit& split, const Tegra::MemoryManager& memory,
                             GPUVAddr address, u64 size) {
         return split.WritesTarget(memory, address, size);
+    }
+
+    static void SetFrontMacros(GpuSplit& split, bool front_macros) {
+        split.front_macros = front_macros;
     }
 
     /// Whether writes to two device addresses share a slot of the noted write positions.
@@ -1024,6 +1033,104 @@ TEST_CASE("Split remembers the semaphore writes its back has not run yet",
     split.Drain(VideoCommon::DrainSite::Other);
     REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
     REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
+}
+
+TEST_CASE("An acquire nothing sent meets suspends without waiting for the back",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    Kernel::KProcess process{f.system.Kernel()};
+    SCOPE_EXIT { f.system.Kernel().UnregisterKernelObject(&process); };
+    auto& table = process.GetPageTable().GetImpl();
+    table.Resize(20, 12);
+    auto* backing = f.physical.GetPointerFromRaw<u8>(0x10000);
+    std::memset(backing, 0, 0x10000);
+    for (u64 page = 0; page < 16; ++page) {
+        table.entries.GetAndFault(4 + page)
+            .Store(false, Common::PageType::Memory, 1,
+                   reinterpret_cast<uintptr_t>(backing) - 0x4000);
+    }
+    process.GetMemory().SetCurrentPageTable(process);
+    const auto asid = f.device_memory.RegisterProcess(&process.GetMemory());
+    f.device_memory.BindInterface(&f.rasterizer);
+    SCOPE_EXIT {
+        f.device_memory.Unmap(0x10000, 0x10000);
+        f.device_memory.UnregisterProcess(asid);
+    };
+    f.device_memory.Map(0x10000, 0x4000, 0x10000, asid);
+    f.memory.BindRasterizer(&f.rasterizer);
+    f.memory.Map(0x100000, 0x10000, 0x10000, Tegra::PTEKind::PITCH, true);
+    const auto store_word = [backing](u32 value) { std::memcpy(backing, &value, sizeof(value)); };
+
+    Tegra::Control::ChannelState channel{0};
+    Tegra::DmaPusher dma_pusher{f.system, f.memory, channel};
+    dma_pusher.BindRasterizer(&f.rasterizer);
+    auto& puller = dma_pusher.puller;
+    const auto acquire = [&](u32 value) {
+        using Call = Tegra::Engines::Puller::MethodCall;
+        puller.CallPullerMethod(dma_pusher, Call{0x4, 0});        // SemaphoreAddressHigh
+        puller.CallPullerMethod(dma_pusher, Call{0x5, 0x100000}); // SemaphoreAddressLow
+        puller.CallPullerMethod(dma_pusher, Call{0x6, value});    // SemaphoreSequencePayload
+        puller.CallPullerMethod(dma_pusher, Call{0x7, 0x4});      // SemaphoreOperation: >=
+    };
+
+    // Below High GPU accuracy releases land as the back runs them (ReleasesLandAtOnce).
+    const auto accuracy = Settings::values.current_gpu_accuracy;
+    Settings::values.current_gpu_accuracy = Settings::GpuAccuracy::Low;
+    Tegra::g_nx2_ampere = true;
+    SCOPE_EXIT {
+        Tegra::g_nx2_ampere = false;
+        Settings::values.current_gpu_accuracy = accuracy;
+    };
+    auto& split = VideoCommon::GpuSplit::Get();
+    Access::Start(split, f.system);
+    Access::SetFrontMacros(split, true);
+    SCOPE_EXIT {
+        split.Stop();
+        Access::SetFrontMacros(split, false);
+    };
+    std::atomic<bool> release{};
+    // Runs before Stop: a failed check must not leave the back in the entry below.
+    SCOPE_EXIT {
+        release = true;
+    };
+    split.Defer([&release] {
+        while (!release.load()) {
+            std::this_thread::yield();
+        }
+    });
+    split.Publish();
+
+    // The back is still in queued work: a drain would wait for it.
+    auto sent = std::async(std::launch::async, [&] { acquire(5); });
+    const bool returned = sent.wait_for(std::chrono::seconds{10}) == std::future_status::ready;
+    if (!returned) {
+        release = true;
+    }
+    REQUIRE(returned);
+    REQUIRE(puller.HasPendingAcquire());
+    // Not counted as suspended yet: lists submitted meanwhile keep their submit-time copies.
+    REQUIRE(dma_pusher.suspensions.load() == 0);
+    // A release in the queued work (a QMD release) latches the waiter registered at the acquire.
+    Tegra::Nx2SemaphoreWaiters::Get().OnWrite(0x10000, 5);
+    REQUIRE(puller.ResumeAcquire(dma_pusher));
+    REQUIRE_FALSE(puller.HasPendingAcquire());
+    REQUIRE(dma_pusher.suspensions.load() == 0);
+
+    // Once the back ran the work before it and the acquire still waits, the channel counts as
+    // suspended and sends the fence work, as after the drain the acquire no longer makes.
+    sent = std::async(std::launch::async, [&] { acquire(9); });
+    REQUIRE(sent.wait_for(std::chrono::seconds{10}) == std::future_status::ready);
+    const u64 sent_at = split.Position();
+    release = true;
+    split.Drain(VideoCommon::DrainSite::Other);
+    REQUIRE_FALSE(puller.ResumeAcquire(dma_pusher));
+    REQUIRE(dma_pusher.suspensions.load() == 1);
+    REQUIRE(split.Position() > sent_at);
+    store_word(9);
+    REQUIRE(puller.ResumeAcquire(dma_pusher));
+    REQUIRE(dma_pusher.suspensions.load() == 2);
 }
 
 TEST_CASE("Split publishes to a back that waits for work after a few words",

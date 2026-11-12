@@ -82,6 +82,13 @@ public:
         /// When an unmet poll last drained (CanResumeAcquire)
         std::chrono::steady_clock::time_point last_drain;
         bool reported; ///< The 2 s warning was logged
+        /// GpuSplit::Position and LastWriterPosition when an acquire that didn't drain was sent,
+        /// and whether the channel counts as suspended since (DmaPusher::suspensions) and sent
+        /// the fence work (ReleaseFences): once the back ran everything before the acquire and it
+        /// still waits, where the drain this replaces did both.
+        u64 sent_at{};
+        u64 writers_before{};
+        bool waits_past_back{};
 
         [[nodiscard]] bool Matches(u32 current) const;
         /// Whether it waits for the word to reach `value` (greater or equal).
