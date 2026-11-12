@@ -257,8 +257,10 @@ public:
     void UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size);
 
     /// `keep_page_gpu_data`: download GPU-written bytes sharing the written pages first (false
-    /// when the memory is going away).
-    void WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data = true);
+    /// when the memory is going away). `engine_write`: the GPU's own engines wrote it (inline
+    /// constant buffer data, MemoryManager::FlushCaching), not the guest CPU.
+    void WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data = true,
+                     bool engine_write = false);
 
     void CachedWriteMemory(DAddr device_addr, u64 size);
 
@@ -718,7 +720,8 @@ private:
 
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
                                                bool native_pointer = false,
-                                               bool table_pointer = false) const;
+                                               bool table_pointer = false,
+                                               bool compute = false) const;
 
     void TraceTablePointer(bool compute, size_t stage, size_t ssbo_index, u32 cbuf_index,
                            u32 cbuf_offset, u32 indirect_offset, GPUVAddr holder,

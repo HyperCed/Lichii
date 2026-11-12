@@ -222,7 +222,8 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 }
 
 template <class P>
-void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data) {
+void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data,
+                                 bool engine_write) {
     Nx2NoteListHostWrite(device_addr, size);
     NoteUniformWrite(device_addr, size);
     // EDEN_NX2_READ_CHECK: a newer value where an early download landed, as ClearDownload
@@ -240,7 +241,14 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
         const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
         if (!gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
             if (!Nx2Perf::Verify()) {
-                memory_tracker.MarkRegionAsCpuModified(device_addr, size);
+                if (engine_write) {
+                    // Untracking the pages and tracking them again at the upload changed their
+                    // host protection twice (two VirtualProtect calls each, ~4% of the GPU
+                    // thread at Ocarina of Time's water) for writes no guest CPU access saw.
+                    memory_tracker.MarkRegionAsWrittenTracked(device_addr, size);
+                } else {
+                    memory_tracker.MarkRegionAsCpuModified(device_addr, size);
+                }
                 MarkVertexBuffersStale(device_addr, size);
                 return;
             }
@@ -1891,7 +1899,7 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
         table_pointer && holder == 0
             ? NULL_BINDING
             : StorageBufferBinding(ssbo_addr, cbuf_index, is_written, native_pointer,
-                                   table_pointer);
+                                   table_pointer, true);
     channel_state->compute_storage_buffers[ssbo_index] = binding;
     if (table_pointer && holder != 0) {
         TraceTablePointer(true, 0, ssbo_index, cbuf_index, cbuf_offset, indirect_offset, holder,
@@ -4150,14 +4158,16 @@ void BufferCache<P>::TraceTablePointer(bool compute, size_t stage, size_t ssbo_i
 
 template <class P>
 Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
-                                             bool native_pointer, bool table_pointer) const {
+                                             bool native_pointer, bool table_pointer,
+                                             bool compute) const {
     const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
 
     if (gpu_addr == 0) {
         return NULL_BINDING;
     }
 
-    const bool reads_size_word = !(table_pointer && !is_written) && !native_pointer;
+    const bool reads_size_word =
+        !(table_pointer && !is_written) && (!native_pointer || (compute && !is_written));
     const u64 next_qword = reads_size_word ? gpu_memory->Read<u64>(ssbo_addr + 8) : 0;
     const u32 alignment = runtime.GetStorageBufferAlignment();
     struct CachedBinding {
@@ -4172,7 +4182,8 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     constexpr size_t ways = 4;
     thread_local std::array<std::array<CachedBinding, ways>, 512> binding_cache{};
     const u32 flags =
-        (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U) | (table_pointer ? 4U : 0U);
+        (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U) | (table_pointer ? 4U : 0U) |
+        (compute ? 8U : 0U);
     const size_t owner = gpu_memory->GetID() + 1;
     const u64 serial = gpu_memory->MapSerial();
     auto& set = binding_cache[((gpu_addr ^ next_qword ^ flags) * 0x9E3779B97F4A7C15ULL) >> 55];
@@ -4190,6 +4201,11 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         u32 size = [&]() {
             const u32 memory_layout_size = static_cast<u32>((std::min)(
                 u64{gpu_memory->GetMemoryLayoutSize(gpu_addr)}, u64{(std::numeric_limits<u32>::max)()}));
+            const u32 packed_size = static_cast<u32>(next_qword);
+            const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
+                                            packed_size != 0 && packed_size <= memory_layout_size;
+            const u64 reach = (std::min)(runtime.GetMaxStorageBufferRange(), u64{1_GiB});
+            const u32 limit = static_cast<u32>(reach - (std::min)(reach, u64{64_KiB}));
             // A pointer read from a table in memory is the base of an object pool, read anywhere in
             // it: bound to the end of its mapping, as far as a storage buffer may reach (at most
             // 1 GiB). Ocarina of Time's grass instances lie 12-18 MiB past theirs (an 8 MiB cap
@@ -4198,19 +4214,23 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             // constant from them. Written pools keep a cap: a write marks the whole binding
             // GPU-modified.
             if (table_pointer && !is_written) {
-                const u64 reach = (std::min)(runtime.GetMaxStorageBufferRange(), u64{1_GiB});
-                const u32 limit = static_cast<u32>(reach - (std::min)(reach, u64{64_KiB}));
                 return (std::min)(memory_layout_size, limit);
             }
-            // A native (Switch 2) compute program's pointer is bare: the word after it is another
-            // parameter (a dimension, stride or texture handle), not an NVN buffer size. Taking it
-            // as one bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
+            // A native compute program's pointer is bare: the word after it is another parameter
+            // (a dimension, stride or texture handle), not an NVN buffer size. Taking it as one
+            // bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
             if (native_pointer) {
-                return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+                const u32 bare = (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+                // Mario Kart World's lighting passes read past 8 MiB from theirs, inside the size
+                // word after the pointer (Eglantine #609 reads it): capped at 8 MiB those reads
+                // came back zero and lit land and characters too dark. A read-only compute binding
+                // takes a larger size word. Binding to the end of the mapping instead spanned
+                // Ocarina of Time's ~1 GiB heap and backed it with a 1 GiB buffer.
+                if (compute && !is_written && next_qword_is_size && packed_size > bare) {
+                    return (std::min)(packed_size, limit);
+                }
+                return bare;
             }
-            const u32 packed_size = static_cast<u32>(next_qword);
-            const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
-                                            packed_size != 0 && packed_size <= memory_layout_size;
             if (next_qword_is_size) {
                 return packed_size;
             }
@@ -4219,7 +4239,41 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         if ((native_pointer || table_pointer) && size != 0) {
             // Stop where the mapping or its device range does: the binding is one device range, and
             // a written one isn't split into separate ranges without sparse sources.
+            const u32 wanted = size;
             size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, size));
+            if (native_pointer && compute) {
+                static std::atomic<u64> computed{}, past_cap{}, at_gap{}, logged{};
+                static std::atomic<u32> largest{};
+                static std::atomic<s64> next_log{};
+                const u64 total = computed.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (size > 8_MiB) {
+                    past_cap.fetch_add(1, std::memory_order_relaxed);
+                    u32 seen = largest.load(std::memory_order_relaxed);
+                    while (size > seen &&
+                           !largest.compare_exchange_weak(seen, size, std::memory_order_relaxed)) {
+                    }
+                }
+                if (size < wanted) {
+                    at_gap.fetch_add(1, std::memory_order_relaxed);
+                }
+                const s64 now = std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count();
+                const u64 long_bindings = past_cap.load(std::memory_order_relaxed);
+                const u64 gap_bindings = at_gap.load(std::memory_order_relaxed);
+                s64 due = next_log.load(std::memory_order_relaxed);
+                if (now >= due && logged.load(std::memory_order_relaxed) !=
+                                      long_bindings + gap_bindings &&
+                    next_log.compare_exchange_strong(due, now + 10)) {
+                    logged.store(long_bindings + gap_bindings, std::memory_order_relaxed);
+                    LOG_INFO(HW_GPU,
+                             "Native compute storage bindings: {} reach past 8 MiB through their "
+                             "size word (largest {:#x} bytes), {} stop at a mapping gap, of {} "
+                             "bound",
+                             long_bindings, largest.load(std::memory_order_relaxed), gap_bindings,
+                             total);
+                }
+            }
         }
 
         // Alignment only applies to the offset of the buffer

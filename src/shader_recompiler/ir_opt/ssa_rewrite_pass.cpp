@@ -20,6 +20,7 @@
 #include <map>
 #include <span>
 #include "common/container/unordered_map.h"
+#include "common/hash.h"
 #include <variant>
 #include <vector>
 
@@ -35,10 +36,19 @@ namespace {
 struct FlagTag {
     auto operator<=>(const FlagTag&) const noexcept = default;
 };
-struct ZeroFlagTag : FlagTag {};
-struct SignFlagTag : FlagTag {};
-struct CarryFlagTag : FlagTag {};
-struct OverflowFlagTag : FlagTag {};
+// Flags and the indirect branch variable name the block slot that stores their definitions.
+struct ZeroFlagTag : FlagTag {
+    static constexpr auto slot{IR::Block::SsaVariable::ZeroFlag};
+};
+struct SignFlagTag : FlagTag {
+    static constexpr auto slot{IR::Block::SsaVariable::SignFlag};
+};
+struct CarryFlagTag : FlagTag {
+    static constexpr auto slot{IR::Block::SsaVariable::CarryFlag};
+};
+struct OverflowFlagTag : FlagTag {
+    static constexpr auto slot{IR::Block::SsaVariable::OverflowFlag};
+};
 
 struct GotoVariable : FlagTag {
     GotoVariable() = default;
@@ -51,12 +61,16 @@ struct GotoVariable : FlagTag {
 
 struct IndirectBranchVariable {
     auto operator<=>(const IndirectBranchVariable&) const noexcept = default;
+
+    static constexpr auto slot{IR::Block::SsaVariable::IndirectBranch};
 };
 
 using Variant = std::variant<IR::Reg, IR::Pred, ZeroFlagTag, SignFlagTag, CarryFlagTag, OverflowFlagTag, GotoVariable, IndirectBranchVariable>;
-// TODO: majority of these require stable iterators, test with XC beforehand
-using ValueMap = std::unordered_map<IR::Block*, IR::Value>;
 
+// Every read walks back through blocks and looks up or writes a definition in each. Fixed-count
+// variables keep their definitions in the blocks: node-based maps per variable made those lookups
+// and their allocations a large part of the pass. Definitions are copied out as soon as they are
+// read, so the goto table needs no stable references.
 struct DefTable {
     const IR::Value& Def(IR::Block* block, IR::Reg variable) {
         return block->SsaRegValue(variable);
@@ -66,62 +80,33 @@ struct DefTable {
     }
 
     const IR::Value& Def(IR::Block* block, IR::Pred variable) {
-        return preds[IR::PredIndex(variable)][block];
+        return block->SsaPredValue(variable);
     }
     void SetDef(IR::Block* block, IR::Pred variable, const IR::Value& value) {
-        preds[IR::PredIndex(variable)].insert_or_assign(block, value);
+        block->SetSsaPredValue(variable, value);
     }
 
     const IR::Value& Def(IR::Block* block, GotoVariable variable) {
-        return goto_vars[variable.index][block];
+        const auto it{goto_vars.find({block, variable.index})};
+        return it != goto_vars.end() ? it->second : empty;
     }
     void SetDef(IR::Block* block, GotoVariable variable, const IR::Value& value) {
-        goto_vars[variable.index].insert_or_assign(block, value);
+        goto_vars.insert_or_assign({block, variable.index}, value);
     }
 
-    const IR::Value& Def(IR::Block* block, IndirectBranchVariable) {
-        return indirect_branch_var[block];
+    template <typename Tag>
+        requires requires { Tag::slot; }
+    const IR::Value& Def(IR::Block* block, Tag) {
+        return block->SsaValue(Tag::slot);
     }
-    void SetDef(IR::Block* block, IndirectBranchVariable, const IR::Value& value) {
-        indirect_branch_var.insert_or_assign(block, value);
-    }
-
-    const IR::Value& Def(IR::Block* block, ZeroFlagTag) {
-        return zero_flag[block];
-    }
-    void SetDef(IR::Block* block, ZeroFlagTag, const IR::Value& value) {
-        zero_flag.insert_or_assign(block, value);
+    template <typename Tag>
+        requires requires { Tag::slot; }
+    void SetDef(IR::Block* block, Tag, const IR::Value& value) {
+        block->SetSsaValue(Tag::slot, value);
     }
 
-    const IR::Value& Def(IR::Block* block, SignFlagTag) {
-        return sign_flag[block];
-    }
-    void SetDef(IR::Block* block, SignFlagTag, const IR::Value& value) {
-        sign_flag.insert_or_assign(block, value);
-    }
-
-    const IR::Value& Def(IR::Block* block, CarryFlagTag) {
-        return carry_flag[block];
-    }
-    void SetDef(IR::Block* block, CarryFlagTag, const IR::Value& value) {
-        carry_flag.insert_or_assign(block, value);
-    }
-
-    const IR::Value& Def(IR::Block* block, OverflowFlagTag) {
-        return overflow_flag[block];
-    }
-    void SetDef(IR::Block* block, OverflowFlagTag, const IR::Value& value) {
-        overflow_flag.insert_or_assign(block, value);
-    }
-
-    std::array<ValueMap, IR::NUM_USER_PREDS> preds;
-    // TODO: Requires stable iterators
-    std::unordered_map<u32, ValueMap> goto_vars;
-    ValueMap indirect_branch_var;
-    ValueMap zero_flag;
-    ValueMap sign_flag;
-    ValueMap carry_flag;
-    ValueMap overflow_flag;
+    Common::unordered_map<std::pair<IR::Block*, u32>, IR::Value, Common::PairHash> goto_vars;
+    const IR::Value empty{};
 };
 
 IR::Opcode UndefOpcode(IR::Reg) noexcept {

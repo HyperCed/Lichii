@@ -61,6 +61,8 @@ DmaPusher::~DmaPusher() = default;
 bool DmaPusher::CanResumeAcquire() {
     if (pending_list_tick) {
         VideoCommon::Count(VideoCommon::g_acquire_stats.list_polls);
+        // Before the check: a tick the host GPU passes after it wakes the GPU thread.
+        Nx2PendingWake::Get().WaitForGpuTick(*pending_list_tick);
         return rasterizer->IsGpuTickDone(*pending_list_tick);
     }
     VideoCommon::Count(VideoCommon::g_acquire_stats.acquire_polls);
