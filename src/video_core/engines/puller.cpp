@@ -500,7 +500,17 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         if (not_met) {
             VideoCommon::Count(stats.trigger_not_met);
         }
-        if (not_met) {
+        // TEST ONLY (EGLA-150 round 1 A/B, never merges): EDEN_NX2_T150_ACQUIRE=0 sends NotMet
+        // acquires down the drain path below, as nx2 does.
+        static const bool t150_acquire = [] {
+            const char* value = std::getenv("EDEN_NX2_T150_ACQUIRE");
+            const bool enabled = value == nullptr || value[0] != '0';
+            LOG_INFO(HW_GPU, "EGLA-150 test switch EDEN_NX2_T150_ACQUIRE: {}",
+                     enabled ? "on (NotMet acquires suspend without a drain)"
+                             : "off (NotMet acquires drain, as nx2)");
+            return enabled;
+        }();
+        if (t150_acquire && not_met) {
             // Nothing the front sent to the word meets it, so only a release it can't see does:
             // one in the work queued for the back, which latches the waiter and wakes this thread
             // (Nx2SemaphoreWaiters::OnWrite, Nx2PendingWake), or a store by the guest CPU. The

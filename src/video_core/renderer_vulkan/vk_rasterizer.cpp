@@ -2665,8 +2665,18 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
     // each draw. Pages no image was ever registered on, and Switch 2 pages the GPU never wrote,
     // get the clean area the caches would return without a look under their locks (after
     // Stephen Jayakar's EDEN_NX2_READ_FASTPATH, eb3553bcb8).
+    // TEST ONLY (EGLA-150 round 1 A/B, never merges): EDEN_NX2_T150_MEMREAD=0 takes both locks on
+    // every call, as nx2 does.
+    static const bool t150_memread = [] {
+        const char* value = std::getenv("EDEN_NX2_T150_MEMREAD");
+        const bool enabled = value == nullptr || value[0] != '0';
+        LOG_INFO(Render_Vulkan, "EGLA-150 test switch EDEN_NX2_T150_MEMREAD: {}",
+                 enabled ? "on (reads of never-GPU-written pages skip the cache locks)"
+                         : "off (locked GetFlushArea, as nx2)");
+        return enabled;
+    }();
     std::optional<VideoCore::RasterizerDownloadArea> texture_area;
-    if (texture_cache.page_filter.Any(addr, size)) {
+    if (!t150_memread || texture_cache.page_filter.Any(addr, size)) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_area = texture_cache.GetFlushArea(addr, size);
     }
@@ -2680,7 +2690,7 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
         return *texture_area;
     }
     if (buffer_cache.FlushesOnCpuRead() &&
-        (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+        (!t150_memread || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
          Tegra::Nx2MayBeGpuWritten(addr, size))) {
         std::scoped_lock lock{buffer_cache.mutex};
         auto area = buffer_cache.GetFlushArea(addr, size);
