@@ -23,10 +23,11 @@ Code is in `src/core/arm/hvf/`.
 - **A one-page guest kernel.** Guest code runs at EL0. Every exception it takes (SVC, abort,
   trapped register) lands on an EL1 vector that leaves the guest with `hvc`; the guest is entered
   again with `eret`, optionally after a TLB flush.
-- **Faults.** A fault on a page the GPU caches is resolved like NCE does (flush or invalidate, then
-  retry). Where the page must stay protected (GPU-written data the buffer cache keeps tracked),
-  the load or store is interpreted through `Memory`, as Dynarmic's slow path does. Any other
-  invalid access is logged and its instruction skipped.
+- **Faults.** A store to a page the GPU caches is interpreted through `Memory`, as Dynarmic's
+  slow path does: the caches learn of the write and usually let the page go, so the stores after
+  it run in the guest. A load brings the GPU's data through the slow read path, then runs in
+  the guest; it is interpreted only where the page stays protected. Any other invalid access is
+  logged and its instruction skipped. `EDEN_NX2_HVF_STATS=1` logs the exits per second by kind.
 
 ## Costs and limits
 

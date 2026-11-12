@@ -3,6 +3,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <utility>
 #include <cstring>
 
@@ -88,6 +91,15 @@ void EnterKernel(const Hvf::Vcpu& vcpu, u64 pc, u64 pstate) {
 // Runs the faulting load or store through the emulator's memory, as Dynarmic's slow path does:
 // for a page that must stay protected. False when the instruction is neither.
 bool InterpretAccess(const Hvf::Vcpu& vcpu, Memory::Memory& memory) {
+    // DC ZVA, Xt: zeroes the 64-byte block Xt points into (memset).
+    if (const u32 instruction = memory.Read32(GetSys(vcpu, HV_SYS_REG_ELR_EL1));
+        (instruction & 0xFFFFFFE0) == 0xD50B7420) {
+        const u32 rt = instruction & 0x1F;
+        const u64 address = rt == 31 ? 0 : GetReg(vcpu, static_cast<hv_reg_t>(HV_REG_X0 + rt));
+        memory.ZeroBlock(address & ~u64{63}, 64);
+        SetSys(vcpu, HV_SYS_REG_ELR_EL1, GetSys(vcpu, HV_SYS_REG_ELR_EL1) + 4);
+        return true;
+    }
     std::array<u64, 31> regs;
     std::array<u128, 32> vregs;
     for (size_t i = 0; i < regs.size(); ++i) {
@@ -103,6 +115,12 @@ bool InterpretAccess(const Hvf::Vcpu& vcpu, Memory::Memory& memory) {
     const u64 pc = GetSys(vcpu, HV_SYS_REG_ELR_EL1);
     const std::optional<u64> next = MatchAndExecuteOneInstruction(memory, regs, vregs, sp, pc);
     if (!next) {
+        // What the interpreter lacks: each of these falls back to invalidating the GPU's caches.
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(Core_ARM, "Access at pc {:#x} is not interpreted: instruction {:08X}", pc,
+                        memory.Read32(pc));
+        }
         return false;
     }
     for (size_t i = 0; i < regs.size(); ++i) {
@@ -118,6 +136,42 @@ bool InterpretAccess(const Hvf::Vcpu& vcpu, Memory::Memory& memory) {
     SetSys(vcpu, HV_SYS_REG_ELR_EL1, *next);
     return true;
 }
+
+// EDEN_NX2_HVF_STATS=1: what makes the guest leave to the host, every 10 s.
+struct ExitStats {
+    std::atomic<u64> svc, system_register, stale_tlb, read_fault, write_fault, interpreted,
+        invalidated;
+    std::atomic<s64> next_report{};
+
+    static bool Enabled() {
+        static const bool enabled = std::getenv("EDEN_NX2_HVF_STATS") != nullptr;
+        return enabled;
+    }
+
+    void Count(std::atomic<u64>& counter) {
+        if (!Enabled()) {
+            return;
+        }
+        counter.fetch_add(1, std::memory_order_relaxed);
+        const s64 now = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        s64 due = next_report.load(std::memory_order_relaxed);
+        if (now < due || !next_report.compare_exchange_strong(due, now + 10)) {
+            return;
+        }
+        if (due == 0) {
+            return; // the first period starts here
+        }
+        const auto rate = [](std::atomic<u64>& value) { return value.exchange(0) / 10; };
+        LOG_INFO(Core_ARM,
+                 "Hypervisor exits per second: {} SVC, {} system register, {} stale TLB, {} read "
+                 "faults, {} write faults ({} interpreted, {} invalidated the GPU's caches)",
+                 rate(svc), rate(system_register), rate(stale_tlb), rate(read_fault),
+                 rate(write_fault), rate(interpreted), rate(invalidated));
+    }
+};
+ExitStats g_stats;
 
 void SkipInstruction(const Hvf::Vcpu& vcpu) {
     SetSys(vcpu, HV_SYS_REG_ELR_EL1, GetSys(vcpu, HV_SYS_REG_ELR_EL1) + 4);
@@ -387,11 +441,13 @@ HaltReason ArmHvf::HandleVector(Hvf::Vcpu& vcpu, u64 vector) {
 
     switch (syndrome >> 26) {
     case EcSvc:
+        g_stats.Count(g_stats.svc);
         m_svc = static_cast<u32>(syndrome & 0xffff);
         return HaltReason::SupervisorCall;
     case EcDataAbort:
         return HandleDataAbort(vcpu, syndrome);
     case EcSystemRegister:
+        g_stats.Count(g_stats.system_register);
         HandleSystemRegister(vcpu, syndrome);
         return {};
     case EcInstructionAbort: {
@@ -429,8 +485,10 @@ HaltReason ArmHvf::HandleDataAbort(Hvf::Vcpu& vcpu, u64 syndrome) {
 
     const Access access = m_space.Query(address, write);
     if (access == Access::Allowed) {
+        g_stats.Count(g_stats.stale_tlb);
         return retry();
     }
+    g_stats.Count(write ? g_stats.write_fault : g_stats.read_fault);
 
     if (pc == m_fault_pc && address == m_fault_address) {
         ++m_fault_repeats;
@@ -466,6 +524,20 @@ HaltReason ArmHvf::HandleDataAbort(Hvf::Vcpu& vcpu, u64 syndrome) {
         }
     }
 
+    const bool gpu_cached =
+        access == Access::Denied &&
+        std::as_const(page_table.GetImpl().entries)[address >> Memory::YUZU_PAGEBITS].Type() ==
+            Common::PageType::RasterizerCachedMemory;
+    // A store to a page the GPU caches goes through the emulator's memory, as Dynarmic's slow
+    // path does: the caches learn of the write, and those that can let the page go, so the stores
+    // after it run in the guest. Invalidating the page here instead makes the GPU thread write
+    // its data out first, and waits for the host GPU.
+    if (write && gpu_cached && InterpretAccess(vcpu, m_memory)) {
+        g_stats.Count(g_stats.interpreted);
+        m_fault_repeats = 0;
+        return {};
+    }
+
     // Pages are protected while the GPU caches them, as with fastmem.
     if (access == Access::Denied && m_fault_repeats < 3) {
         if (!write) {
@@ -477,17 +549,15 @@ HaltReason ArmHvf::HandleDataAbort(Hvf::Vcpu& vcpu, u64 syndrome) {
                 return retry();
             }
         }
+        g_stats.Count(g_stats.invalidated);
         if (m_memory.InvalidateNCE(page_address, Memory::YUZU_PAGESIZE) &&
             m_space.Query(address, write) == Access::Allowed) {
             return retry();
         }
     }
-    // The page stays protected (the GPU still tracks it): the access goes through the emulator's
-    // memory instead.
-    if (access == Access::Denied &&
-        std::as_const(page_table.GetImpl().entries)[address >> Memory::YUZU_PAGEBITS].Type() ==
-            Common::PageType::RasterizerCachedMemory &&
-        InterpretAccess(vcpu, m_memory)) {
+    // A load from a page that stays protected goes through the emulator's memory too.
+    if (gpu_cached && InterpretAccess(vcpu, m_memory)) {
+        g_stats.Count(g_stats.interpreted);
         m_fault_repeats = 0;
         return {};
     }
