@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <span>
 #include <thread>
@@ -34,6 +35,10 @@
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
+#ifdef HAS_HVF
+#include "core/arm/hvf/arm_hvf.h"
+#include "core/arm/hvf/hvf_vm.h"
+#endif
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
@@ -72,6 +77,47 @@ struct Memory::Impl {
 #else
         host_buffer = std::addressof(system.DeviceMemory().buffer);
 #endif
+
+#ifdef HAS_HVF
+        hvf_space.reset();
+        auto& buffer = system.DeviceMemory().buffer;
+        if (current_page_table->fastmem_arena &&
+            Core::ArmHvf::IsUsable(process,
+                                   static_cast<u32>(current_page_table->GetAddressSpaceBits())) &&
+            Hvf::VirtualMachine::Instance()->SetBacking(buffer.BackingBasePointer(),
+                                                        buffer.BackingSize())) {
+            hvf_space.emplace(*Hvf::VirtualMachine::Instance());
+        }
+#endif
+    }
+
+    // The fastmem arena, and the guest's own translation tables when it runs under the hypervisor.
+    void HostMap(u64 vaddr, u64 host_offset, u64 size, Common::MemoryPermission perms,
+                 bool separate_heap) {
+        host_buffer->Map(vaddr, host_offset, size, perms, separate_heap);
+#ifdef HAS_HVF
+        if (hvf_space) {
+            hvf_space->Map(vaddr, host_offset, size, perms);
+        }
+#endif
+    }
+
+    void HostUnmap(u64 vaddr, u64 size, bool separate_heap) {
+        host_buffer->Unmap(vaddr, size, separate_heap);
+#ifdef HAS_HVF
+        if (hvf_space) {
+            hvf_space->Unmap(vaddr, size);
+        }
+#endif
+    }
+
+    void HostProtect(u64 vaddr, u64 size, Common::MemoryPermission perms) {
+        host_buffer->Protect(vaddr, size, perms);
+#ifdef HAS_HVF
+        if (hvf_space) {
+            hvf_space->Protect(vaddr, size, perms);
+        }
+#endif
     }
 
     void MapMemoryRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
@@ -85,7 +131,7 @@ struct Memory::Impl {
                  Common::PageType::Memory);
 
         if (current_page_table->fastmem_arena) {
-            host_buffer->Map(GetInteger(base), GetInteger(target) - DramMemoryMap::Base, size, perms, separate_heap);
+            HostMap(GetInteger(base), GetInteger(target) - DramMemoryMap::Base, size, perms, separate_heap);
         }
     }
 
@@ -97,7 +143,7 @@ struct Memory::Impl {
                  Common::PageType::Unmapped);
 
         if (current_page_table->fastmem_arena) {
-            host_buffer->Unmap(GetInteger(base), size, separate_heap);
+            HostUnmap(GetInteger(base), size, separate_heap);
         }
     }
 
@@ -118,7 +164,7 @@ struct Memory::Impl {
             switch (page_type) {
             case Common::PageType::RasterizerCachedMemory:
                 if (protect_bytes > 0) {
-                    host_buffer->Protect(protect_begin, protect_bytes, perms);
+                    HostProtect(protect_begin, protect_bytes, perms);
                     protect_bytes = 0;
                 }
                 break;
@@ -130,7 +176,7 @@ struct Memory::Impl {
         }
 
         if (protect_bytes > 0) {
-            host_buffer->Protect(protect_begin, protect_bytes, perms);
+            HostProtect(protect_begin, protect_bytes, perms);
         }
     }
 
@@ -445,7 +491,7 @@ struct Memory::Impl {
         if (current_page_table->fastmem_arena) {
             const auto perm{debug ? Common::MemoryPermission{}
                                   : Common::MemoryPermission::ReadWrite};
-            host_buffer->Protect(vaddr, size, perm);
+            HostProtect(vaddr, size, perm);
         }
 
         // Iterate over a contiguous CPU address space, marking/unmarking the region.
@@ -516,7 +562,7 @@ struct Memory::Impl {
             if (!cached) {
                 perm |= Common::MemoryPermission::Write;
             }
-            host_buffer->Protect(vaddr, size, perm);
+            HostProtect(vaddr, size, perm);
             if (cached && perm != Common::MemoryPermission{}) {
                 ProtectArmedPages(vaddr, size);
             }
@@ -609,7 +655,7 @@ struct Memory::Impl {
             if (run_pages > 0) {
                 // Reads that hit a cached read area must not skip the flush of a new trap.
                 read_trap_generation.fetch_add(1, std::memory_order_release);
-                host_buffer->Protect(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
+                HostProtect(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
                                      Common::MemoryPermission{});
                 run_pages = 0;
             }
@@ -649,7 +695,7 @@ struct Memory::Impl {
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
         for (auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
              it != armed_read_traps.end() && *it < page_end; ++it) {
-            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
+            HostProtect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
         }
     }
 
@@ -663,7 +709,7 @@ struct Memory::Impl {
         auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
         while (it != armed_read_traps.end() && *it < page_end) {
             // Still cached (this read came through the rasterizer path): writes stay trapped.
-            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE,
+            HostProtect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE,
                                  Common::MemoryPermission::Read);
             it = armed_read_traps.erase(it);
             armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
@@ -1012,6 +1058,9 @@ struct Memory::Impl {
 #else
     Common::HostMemory* host_buffer{};
 #endif
+#ifdef HAS_HVF
+    std::optional<Hvf::AddressSpace> hvf_space;
+#endif
     std::atomic<u64> block_count = 0;
 };
 
@@ -1028,6 +1077,12 @@ void Memory::Reset() {
 void Memory::SetCurrentPageTable(Kernel::KProcess& process) {
     impl->SetCurrentPageTable(process);
 }
+
+#ifdef HAS_HVF
+Hvf::AddressSpace* Memory::GetHvfAddressSpace() {
+    return impl->hvf_space ? std::addressof(*impl->hvf_space) : nullptr;
+}
+#endif
 
 void Memory::MapMemoryRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
                              Common::PhysicalAddress target, Common::MemoryPermission perms,

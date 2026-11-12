@@ -72,6 +72,13 @@ endif()
 
 create_target_directory_groups(yuzu-cmd)
 
+if (HAS_HVF AND NOT CMAKE_GENERATOR MATCHES "Xcode")
+    # The Hypervisor CPU backend needs com.apple.security.hypervisor; ad-hoc signing grants it.
+    add_custom_command(TARGET yuzu-cmd POST_BUILD
+        COMMAND codesign --force --sign - --entitlements
+            "${CMAKE_SOURCE_DIR}/dist/eglantine.entitlements" "$<TARGET_FILE:yuzu-cmd>")
+endif()
+
 # needed for vma
 if (NOT MSVC)
     target_compile_options(yuzu-cmd PRIVATE

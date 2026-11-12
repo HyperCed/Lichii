@@ -530,3 +530,15 @@ if (LICHII_NXFORMAT_RUNTIME)
 endif()
 
 create_target_directory_groups(yuzu)
+
+if (HAS_HVF AND NOT CMAKE_GENERATOR MATCHES "Xcode")
+    # The Hypervisor CPU backend needs com.apple.security.hypervisor; ad-hoc signing grants it.
+    # In place, codesign would seal the whole bundle and refuse its unsigned contents, so the
+    # program is signed as a bare executable.
+    set(_signed "${CMAKE_CURRENT_BINARY_DIR}/lichii-signed")
+    add_custom_command(TARGET yuzu POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:yuzu>" "${_signed}"
+        COMMAND codesign --force --sign - --entitlements
+            "${CMAKE_SOURCE_DIR}/dist/eglantine.entitlements" "${_signed}"
+        COMMAND ${CMAKE_COMMAND} -E copy "${_signed}" "$<TARGET_FILE:yuzu>")
+endif()
