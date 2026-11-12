@@ -3906,6 +3906,114 @@ bool Image::BackTilesWhole() {
     return true;
 }
 
+bool Image::ReleasesUnmappedTiles() const noexcept {
+    return sparse_layers.allocator != nullptr && !sparse_layers.level_tiles.empty() &&
+           sparse_layers.zero_block == VK_NULL_HANDLE && BindsArraysByTile(runtime->device);
+}
+
+void Image::ReleaseTilesOutside(std::span<const VideoCommon::LevelRect> keep) {
+    SparseLayerMemory& s = sparse_layers;
+    if (s.allocator == nullptr || s.tail_level == 0) {
+        return;
+    }
+    const Device& device = runtime->device;
+    const u64 tile = s.requirements.alignment;
+    // Per layer and level, the blocks to keep.
+    std::vector<std::vector<bool>> kept(s.level_tiles.size());
+    for (const VideoCommon::LevelRect& rect : keep) {
+        const u32 level = static_cast<u32>(rect.level);
+        if (level >= s.tail_level) {
+            continue;
+        }
+        const size_t index = size_t{rect.layer} * s.tail_level + level;
+        if (kept[index].empty()) {
+            kept[index].assign(s.level_tiles[index].size(), false);
+        }
+        const u32 tiles_x = Common::DivCeil((std::max)(s.width >> level, 1U), s.tile_width);
+        for (u32 ty = rect.y / s.tile_height; ty <= (rect.y + rect.height - 1) / s.tile_height;
+             ++ty) {
+            for (u32 tx = rect.x / s.tile_width; tx <= (rect.x + rect.width - 1) / s.tile_width;
+                 ++tx) {
+                kept[index][size_t{ty} * tiles_x + tx] = true;
+            }
+        }
+    }
+    std::vector<VkSparseImageMemoryBind> image_binds;
+    std::vector<VmaAllocation*> released;
+    for (size_t index = 0; index < s.level_tiles.size(); ++index) {
+        const u32 level = static_cast<u32>(index % s.tail_level);
+        const u32 layer = static_cast<u32>(index / s.tail_level);
+        const u32 width = (std::max)(s.width >> level, 1U);
+        const u32 height = (std::max)(s.height >> level, 1U);
+        const u32 tiles_x = Common::DivCeil(width, s.tile_width);
+        for (size_t block = 0; block < s.level_tiles[index].size(); ++block) {
+            VmaAllocation& allocation = s.level_tiles[index][block];
+            if (allocation == VK_NULL_HANDLE || (!kept[index].empty() && kept[index][block])) {
+                continue;
+            }
+            const u32 x = static_cast<u32>(block % tiles_x) * s.tile_width;
+            const u32 y = static_cast<u32>(block / tiles_x) * s.tile_height;
+            released.push_back(&allocation);
+            image_binds.push_back(VkSparseImageMemoryBind{
+                .subresource{
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .mipLevel = level,
+                    .arrayLayer = layer,
+                },
+                .offset{static_cast<s32>(x), static_cast<s32>(y), 0},
+                .extent{(std::min)(s.tile_width, width - x), (std::min)(s.tile_height, height - y),
+                        1},
+                .memory = VK_NULL_HANDLE,
+                .memoryOffset = 0,
+                .flags = 0,
+            });
+        }
+    }
+    if (image_binds.empty()) {
+        return;
+    }
+    const VkSparseImageMemoryBindInfo image_bind_info{
+        .image = *original_image,
+        .bindCount = static_cast<u32>(image_binds.size()),
+        .pBinds = image_binds.data(),
+    };
+    const VkBindSparseInfo bind_info{
+        .sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO,
+        .pNext = nullptr,
+        .waitSemaphoreCount = 0,
+        .pWaitSemaphores = nullptr,
+        .bufferBindCount = 0,
+        .pBufferBinds = nullptr,
+        .imageOpaqueBindCount = 0,
+        .pImageOpaqueBinds = nullptr,
+        .imageBindCount = 1,
+        .pImageBinds = &image_bind_info,
+        .signalSemaphoreCount = 0,
+        .pSignalSemaphores = nullptr,
+    };
+    vk::Fence fence = device.GetLogical().CreateFence(VkFenceCreateInfo{
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+    });
+    VkResult result;
+    {
+        std::scoped_lock lock{scheduler->submit_mutex};
+        result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
+    }
+    if (result != VK_SUCCESS) {
+        LOG_ERROR(Render_Vulkan, "Sparse tiled image {:#x}: releasing blocks failed ({})", gpu_addr,
+                  static_cast<int>(result));
+        return;
+    }
+    fence.Wait();
+    for (VmaAllocation* const allocation : released) {
+        s.allocator->FreeSparseMemory(*allocation);
+        *allocation = VK_NULL_HANDLE;
+        s.bound_bytes -= tile;
+    }
+}
+
 bool Image::BindTiles(std::span<const VideoCommon::LevelRect> rects) {
     SparseLayerMemory& s = sparse_layers;
     if (s.allocator == nullptr) {
