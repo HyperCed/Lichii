@@ -52,11 +52,15 @@ TEST_CASE("The host memory bound does not wrap", "[video_core][texture_cache][ho
 
 TEST_CASE("The system's commit room is reported where there is a commit limit",
           "[video_core][texture_cache][host_memory_limit]") {
-    const std::optional<u64> room = Common::GetSystemCommitRoom();
+    const std::optional<s64> room = Common::GetSystemCommitRoom();
 #ifdef _WIN32
     REQUIRE(room.has_value());
     const Common::ProcessMemoryUsage usage = Common::GetProcessMemoryUsage();
-    REQUIRE(*room <= usage.system_commit_limit);
+    REQUIRE(*room >= 0);
+    REQUIRE(static_cast<u64>(*room) <= usage.system_commit_limit);
+#elif defined(__APPLE__)
+    REQUIRE(room.has_value());
+    REQUIRE(*room < static_cast<s64>(Common::GetMemInfo().TotalPhysicalMemory));
 #else
     REQUIRE_FALSE(room.has_value());
 #endif

@@ -441,11 +441,16 @@ void TextureCache<P>::TickFrame() {
                         budget - (std::min)(margin + pressure_margin + slack_margin, budget / 2);
                     // The device's budget is not all the room there is: see HostCriticalMemory.
                     // The usage is the driver's, which still counts images waiting to be freed.
-                    const std::optional<u64> commit_room = Common::GetSystemCommitRoom();
-                    const u64 host_critical =
-                        commit_room
-                            ? HostCriticalMemory(runtime.GetDeviceMemoryUsage(), *commit_room)
-                            : (std::numeric_limits<u64>::max)();
+                    const std::optional<s64> commit_room = Common::GetSystemCommitRoom();
+                    u64 host_critical = (std::numeric_limits<u64>::max)();
+                    if (commit_room) {
+                        // Under zero, the cache gives back what the host is short of.
+                        const u64 usage = runtime.GetDeviceMemoryUsage();
+                        const u64 short_of = static_cast<u64>(-(std::min)(*commit_room, s64{0}));
+                        host_critical =
+                            HostCriticalMemory(usage - (std::min)(usage, short_of),
+                                               static_cast<u64>((std::max)(*commit_room, s64{0})));
+                    }
                     critical_memory = (std::min)(critical_memory, host_critical);
                     const u64 room_margin = (std::min)(pressure_margin + slack_margin, budget / 2);
                     retention_limit = (std::min)(budget - room_margin, host_critical);
@@ -468,7 +473,7 @@ void TextureCache<P>::TickFrame() {
                                  margin >> 20, pressure_margin >> 20, slack_margin >> 20);
                         if (commit_room) {
                             LOG_INFO(HW_GPU, "Host memory: {} MiB of commit left, {}",
-                                     *commit_room >> 20,
+                                     *commit_room / s64{1_MiB},
                                      critical_memory == host_critical
                                          ? "which bounds the thresholds"
                                          : "the device budget bounds the thresholds");
@@ -2354,14 +2359,31 @@ void TextureCache<P>::RefreshSparseTiles(Image& image) {
             runtime.TransitionImageLayout(image);
             return;
         }
-        const size_t bytes = UnswizzledRectsBytes(image.info, rects);
-        auto staging = runtime.UploadStagingBuffer(bytes);
-        const std::vector<BufferImageCopy> copies =
-            UnswizzleImageRects(*gpu_memory, image.gpu_addr, image.info, rects, staging.mapped_span);
-        image.UploadMemory(staging, copies);
+        // In parts: the data a large array can hold is hundreds of MiB, too much for one staging
+        // buffer.
+        constexpr size_t MaxUploadBytes = 64_MiB;
+        const std::span<const LevelRect> all{rects};
+        for (size_t first = 0; first < all.size();) {
+            size_t count = 1;
+            size_t bytes = UnswizzledRectsBytes(image.info, all.subspan(first, 1));
+            while (first + count < all.size()) {
+                const size_t next = UnswizzledRectsBytes(image.info, all.subspan(first + count, 1));
+                if (bytes + next > MaxUploadBytes) {
+                    break;
+                }
+                bytes += next;
+                ++count;
+            }
+            const std::span<const LevelRect> part = all.subspan(first, count);
+            auto staging = runtime.UploadStagingBuffer(bytes);
+            const std::vector<BufferImageCopy> copies = UnswizzleImageRects(
+                *gpu_memory, image.gpu_addr, image.info, part, staging.mapped_span);
+            image.UploadMemory(staging, copies);
+            uploaded_bytes += bytes;
+            first += count;
+        }
         runtime.InsertUploadMemoryBarrier();
         ++images_uploaded;
-        uploaded_bytes += bytes;
     }
 }
 
