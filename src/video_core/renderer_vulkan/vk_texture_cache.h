@@ -549,6 +549,14 @@ public:
     /// levels in it) device memory where they have none yet. False if that failed.
     bool BindTiles(std::span<const VideoCommon::LevelRect> rects);
 
+    /// SparseTiles images whose blocks come from a pool of fixed size: whether the blocks the game
+    /// no longer maps give their memory back.
+    bool ReleasesUnmappedTiles() const noexcept;
+
+    /// SparseTiles images: takes the memory of the host sparse blocks outside `keep` away (they
+    /// read zero again). Mip tails stay.
+    void ReleaseTilesOutside(std::span<const VideoCommon::LevelRect> keep);
+
     /// SparseTiles images: the host sparse block, in texels, and the first level of the mip tail.
     u32 SparseTileWidth() const noexcept {
         return sparse_layers.tile_width;

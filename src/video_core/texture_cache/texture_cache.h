@@ -2355,6 +2355,19 @@ void TextureCache<P>::RefreshSparseTiles(Image& image) {
         const std::vector<LevelRect> rects =
             SparseTileRects(image.info, ranges, image.SparseTileWidth(), image.SparseTileHeight(),
                             image.SparseTailLevel());
+        if constexpr (requires { &Image::ReleaseTilesOutside; }) {
+            // First, so the blocks the game stopped mapping make room for those it maps now.
+            if (image.ReleasesUnmappedTiles()) {
+                const std::vector<LevelRect> keep = SparseTileRects(
+                    image.info, Tegra::Nx2SparseDataRanges(image.gpu_addr, image.guest_size_bytes),
+                    image.SparseTileWidth(), image.SparseTileHeight(), image.SparseTailLevel());
+                const u64 bound_bytes = ImageMemoryBytes(image);
+                image.ReleaseTilesOutside(keep);
+                if (True(image.flags & ImageFlagBits::Registered)) {
+                    total_used_memory += ImageMemoryBytes(image) - bound_bytes;
+                }
+            }
+        }
         if (rects.empty() || !BindSparseTiles(image, rects)) {
             runtime.TransitionImageLayout(image);
             return;
