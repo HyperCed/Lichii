@@ -716,6 +716,25 @@ struct Memory::Impl {
         }
     }
 
+    /// For a backend that can't read a cached page through the slow path: after a slow-path read
+    /// the page's data is current, yet its trap may still stand (the read was inside the area a
+    /// previous download cleared, so nothing disarmed it).
+    bool GrantCachedPageRead(u64 vaddr) {
+        const u64 page = vaddr >> YUZU_PAGEBITS;
+        if (!AddressSpaceContains(*current_page_table, vaddr, 1) ||
+            std::as_const(current_page_table->entries)[page].Type() !=
+                Common::PageType::RasterizerCachedMemory) {
+            return false;
+        }
+        std::scoped_lock lk{read_trap_mutex};
+        if (armed_read_traps.erase(page) != 0) {
+            armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
+        }
+        // Still cached: writes stay trapped.
+        HostProtect(page << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission::Read);
+        return true;
+    }
+
     /**
      * Maps a region of pages as a specific type.
      *
@@ -1262,6 +1281,10 @@ void Memory::RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size) {
 
 void Memory::MarkRegionDebug(Common::ProcessAddress vaddr, u64 size, bool debug) {
     impl->MarkRegionDebug(GetInteger(vaddr), size, debug);
+}
+
+bool Memory::GrantCachedPageRead(Common::ProcessAddress vaddr) {
+    return impl->GrantCachedPageRead(GetInteger(vaddr));
 }
 
 bool Memory::InvalidateNCE(Common::ProcessAddress vaddr, size_t size) {
