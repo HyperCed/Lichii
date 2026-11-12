@@ -9,6 +9,7 @@
 #include <array>
 #include <optional>
 #include <string_view>
+#include <unordered_set>
 
 #include <boost/container/static_vector.hpp>
 
@@ -162,7 +163,8 @@ public:
                                    const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                                    const Tegra::Texture::TICEntry* depth,
                                    std::array<f32, 2> jitter,
-                                   std::array<f32, 2> motion_scale, bool use_history = true) override;
+                                   std::array<f32, 2> motion_scale, bool use_history,
+                                   std::optional<std::array<u32, 2>> render_region) override;
     VideoCommon::OotNetwork::BypassState* OotNetworkBypass() override;
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
@@ -248,6 +250,8 @@ private:
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
+    /// Clears a 3D color target whose slices the framebuffer can't reach. Returns true when handled.
+    bool ClearVolumeSlices(const Framebuffer* framebuffer, u32 first_slice, u32 slice_count);
     void FrameDumpPass(const Framebuffer* framebuffer);
     /// EDEN_NX2_PENDING_WRITE_TRACE: logs bound buffer ranges with collected, unapplied CPU writes.
     void TracePendingCpuWrites(bool compute, std::span<const u64> shader_hashes);
@@ -450,6 +454,27 @@ private:
     void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u64 serial,
                           u64 map_serial);
     void ReportFastDraws();
+
+    /// EDEN_NX2_DRAW_REUSE_PROBE: a configured draw's key (state that rarely changes between
+    /// frames, leaving out uniform buffers) was in the previous frame, only earlier in this one,
+    /// or in neither.
+    enum class DrawReuse : u8 { Hit, Repeat, Miss, Count };
+    struct DrawReuseProbe {
+        std::unordered_set<u64> previous_frame;
+        std::unordered_set<u64> frame;
+        std::array<std::array<u64, static_cast<size_t>(DrawPath::Count)>,
+                   static_cast<size_t>(DrawReuse::Count)>
+            draws{}, prepare_ns{};
+        u64 gate_ns{}; ///< Full-path hits: their PrepareDraw time over 1.1 us
+        u64 probe_ns{}; ///< NoteDrawReuse's own time, left out of prepare_ns
+        u64 frames{};
+        u64 window_start{};
+    };
+    /// Classifies the draw just configured with `pipeline` and adds its key to the frame's.
+    DrawReuse NoteDrawReuse(const GraphicsPipeline& pipeline, bool is_indexed);
+    void TickDrawReuse();
+    DrawReuseProbe draw_reuse;
+
     ReusableDraw reusable_draw;
     ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
     /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.

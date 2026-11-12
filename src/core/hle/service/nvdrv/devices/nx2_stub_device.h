@@ -152,6 +152,12 @@ public:
         }
     }
 
+    // A block waiting for memory keeps what is written to it until BackSparse gives it some
+    // (the back listener with cpu_address 0).
+    void KeepSparseWrites(u64 gpu_address, u64 size) {
+        BackSparse(gpu_address, 0, size);
+    }
+
     void BackSparse(u64 gpu_address, u64 cpu_address, u64 size) {
         std::scoped_lock lk{mutex};
         for (auto& [owner, listener] : listeners) {

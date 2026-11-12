@@ -45,13 +45,18 @@ public:
     ResultStatus ReadProgramId(u64& out_program_id) override;
     ResultStatus ReadProgramIds(std::vector<u64>& out_program_ids) override;
     ResultStatus ReadIcon(std::vector<u8>& buffer) override;
+    ResultStatus ReadOriginalIcon(u64 application_id, std::vector<u8>& buffer) const;
     ResultStatus ReadTitle(std::string& title) override;
+    ResultStatus ReadPublisher(std::string& publisher) const;
     ResultStatus ReadControlData(FileSys::NACP& control) override;
     ResultStatus ReadDisplayVersion(std::string& version) override;
     ResultStatus ReadNSOModules(Modules& modules) override;
 
+    /// The RomFS the program sees, without mods: a tree snapshot as stored, or the native
+    /// base RomFS with its newest enabled update applied. Used to dump the RomFS.
+    ResultStatus ReadPatchedRomFS(FileSys::VirtualFile& out_file);
 
-    /// Adds the update and add-on NCAs of a native archive to a content provider, so the
+    /// Adds the base, update and add-on NCAs of a native archive to a content provider, so the
     /// patch manager finds them as it does for a base NSP with separate update files.
     void RegisterContent(FileSys::ManualContentProvider& provider) const;
 

@@ -79,6 +79,16 @@ public:
         });
     }
 
+    /// As MarkRegionAsCpuModified, for data the GPU's own engines wrote to guest memory (inline
+    /// constant buffer data): the pages stay tracked, as no guest CPU write needs to be let
+    /// through, and the next upload has nothing to track again.
+    void MarkRegionAsWrittenTracked(VAddr dirty_cpu_addr, u64 query_size) {
+        ForgetSynchronized(dirty_cpu_addr, query_size);
+        IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
+            manager->MarkWrittenTracked(manager->cpu_addr + offset, size);
+        });
+    }
+
     /// Unmark region as CPU modified, notifying the device_tracker about this change
     void UnmarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {

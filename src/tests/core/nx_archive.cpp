@@ -18,6 +18,8 @@
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/registered_cache.h"
+#include "core/file_sys/romfs_factory.h"
+#include "core/file_sys/patch_manager.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/file_sys/vfs/vfs_vector.h"
@@ -302,4 +304,90 @@ TEST_CASE("NX: an extracted add-on is listed as add-on content after Load", "[co
     const auto romfs = FileSys::ExtractRomFS(nca->GetRomFS());
     REQUIRE(romfs != nullptr);
     CHECK(ReadText(romfs->GetFile("dlc.bin")) == "dlc");
+}
+
+TEST_CASE("NX: a native base supports external updates and version disabling",
+          "[core][nx][external]") {
+    for (const auto archive : {"native_external_base.nx", "native_embedded_update.nx"}) {
+        DYNAMIC_SECTION(archive) {
+            ScopedSystemTestContext environment;
+            Core::System system;
+            system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
+            FileSys::ManualContentProvider provider;
+            system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
+                                           &provider);
+            Loader::AppLoader_NX loader{system, OpenFixture(archive)};
+            u64 program_id{};
+            REQUIRE(loader.ReadProgramId(program_id) == Loader::ResultStatus::Success);
+            REQUIRE(program_id == ApplicationId);
+            loader.RegisterContent(provider);
+            const auto base = provider.GetEntry(ApplicationId, FileSys::ContentRecordType::Program);
+            REQUIRE(base != nullptr);
+            REQUIRE(base->GetStatus() == Loader::ResultStatus::Success);
+            FileSys::RomFSFactory factory{loader, system.GetContentProvider(),
+                                          system.GetFileSystemController()};
+            const auto data = [&] {
+                const auto romfs = factory.OpenCurrentProcess(ApplicationId);
+                REQUIRE(romfs != nullptr);
+                const auto tree = FileSys::ExtractRomFS(romfs);
+                REQUIRE(tree != nullptr);
+                const auto file = tree->GetFile("data.bin");
+                REQUIRE(file != nullptr);
+                return file->ReadAllBytes();
+            };
+            CHECK(data() ==
+                  std::vector<u8>(
+                      4096, std::string_view(archive) == "native_external_base.nx" ? 0x11 : 0x22));
+            REQUIRE(provider.AddEntriesFromContainer(OpenFixture("external_update.nsp")));
+            const FileSys::PatchManager patches{ApplicationId, system.GetFileSystemController(),
+                                                system.GetContentProvider()};
+            const auto build_byte = [&] {
+                const auto exefs = patches.PatchExeFS(base->GetExeFS());
+                REQUIRE(exefs != nullptr);
+                const auto main = exefs->GetFile("main");
+                REQUIRE(main != nullptr);
+                return main->ReadByte(64);
+            };
+            CHECK(data() == std::vector<u8>(4096, 0x33));
+            CHECK(build_byte() == 0x33);
+            const auto previous = Settings::values.disabled_addons[ApplicationId];
+            SCOPE_EXIT {
+                Settings::values.disabled_addons[ApplicationId] = previous;
+            };
+            Settings::values.disabled_addons[ApplicationId] = {"Update@2"};
+            CHECK(data() ==
+                  std::vector<u8>(
+                      4096, std::string_view(archive) == "native_external_base.nx" ? 0x11 : 0x22));
+            CHECK(build_byte() ==
+                  (std::string_view(archive) == "native_external_base.nx" ? 0x11 : 0x22));
+        }
+    }
+}
+
+TEST_CASE("NX: registering an archive preserves an external NSP add-on", "[core][nx][external]") {
+    for (const auto archive : {"lichii_synthetic.nx", "native_external_base.nx"}) {
+        DYNAMIC_SECTION(archive) {
+            ScopedSystemTestContext environment;
+            Core::System system;
+            system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
+            FileSys::ManualContentProvider provider;
+            system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
+                                           &provider);
+            REQUIRE(provider.AddEntriesFromContainer(OpenFixture("external_dlc.nsp")));
+            Loader::AppLoader_NX loader{system, OpenFixture(archive)};
+            loader.RegisterContent(provider);
+            const auto entries = provider.ListEntriesFilter(
+                FileSys::TitleType::AOC, FileSys::ContentRecordType::Data, std::nullopt);
+            REQUIRE(entries.size() == (std::string_view(archive) == "lichii_synthetic.nx" ? 2 : 1));
+            const auto dlc =
+                provider.GetEntry(ApplicationId + 0x1002, FileSys::ContentRecordType::Data);
+            REQUIRE(dlc != nullptr);
+            REQUIRE(dlc->GetStatus() == Loader::ResultStatus::Success);
+            const auto tree = FileSys::ExtractRomFS(dlc->GetRomFS());
+            REQUIRE(tree != nullptr);
+            const auto file = tree->GetFile("dlc.bin");
+            REQUIRE(file != nullptr);
+            CHECK(file->ReadAllBytes() == std::vector<u8>(8192, 0x44));
+        }
+    }
 }
