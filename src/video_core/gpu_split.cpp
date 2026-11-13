@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <optional>
 #include <thread>
 
 #ifdef _MSC_VER
@@ -14,6 +15,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
+#ifdef __GLIBC__
+#include <execinfo.h>
 #endif
 #include <cstring>
 #include <string>
@@ -57,6 +61,30 @@ BackIdleTrace::FrontState WaitState(DrainSite site) {
                : BackIdleTrace::FrontState::Drain;
 }
 
+// A wait of the front for its back, counted by site while g_acquire_stats counts.
+class CountedWait {
+public:
+    explicit CountedWait(DrainSite site_) : site{static_cast<size_t>(site_)} {
+        if (g_acquire_counting) {
+            start = std::chrono::steady_clock::now();
+        }
+    }
+    ~CountedWait() {
+        if (!start) {
+            return;
+        }
+        Count(g_acquire_stats.site_drains[site]);
+        Count(g_acquire_stats.site_drain_ns[site],
+              static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - *start)
+                                   .count()));
+    }
+
+private:
+    size_t site;
+    std::optional<std::chrono::steady_clock::time_point> start;
+};
+
 } // Anonymous namespace
 
 void GpuSplit::CheckOwner(const char* where) {
@@ -92,7 +120,27 @@ void GpuSplit::CheckOwner(const char* where) {
     LOG_ERROR(HW_GPU, "GPU split owner check: {} on thread {} while the back runs; stack:{}",
               where, thread, stack);
 #else
-    (void)where;
+    // Also while the back is idle: its idle hook submits (Scheduler::FlushDeferred).
+    if (on_back_thread || !instance.back_running.load(std::memory_order_acquire)) {
+        return;
+    }
+    static std::atomic<u32> reports{};
+    if (reports.fetch_add(1) >= 12) {
+        return;
+    }
+    std::string stack;
+#ifdef __GLIBC__
+    void* frames[40];
+    const int count = backtrace(frames, 40);
+    if (char** const symbols = backtrace_symbols(frames, count)) {
+        for (int i = 1; i < count; ++i) {
+            stack += fmt::format("\n  {}", symbols[i]);
+        }
+        std::free(symbols);
+    }
+#endif
+    LOG_ERROR(HW_GPU, "GPU split owner check: {} on a thread other than the back; stack:{}", where,
+              stack);
 #endif
 }
 
@@ -127,7 +175,9 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     check_owner = std::getenv("EDEN_NX2_SPLIT_CHECK") != nullptr;
     const char* const verify = std::getenv("EDEN_NX2_ACQUIRE_VERIFY");
     g_acquire_verify = verify != nullptr && verify[0] == '1';
-    g_acquire_counting = g_acquire_verify || Nx2Profile::Enabled();
+    g_acquire_counting = g_acquire_verify || Nx2Profile::Enabled() ||
+                         std::getenv("EDEN_NX2_ACQUIRE_STATS") != nullptr ||
+                         std::getenv("EDEN_NX2_GUEST_THREAD_STATS") != nullptr;
     ring = std::make_unique<u64[]>(RingWords);
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
@@ -194,6 +244,7 @@ void GpuSplit::WaitForSpace(size_t words) {
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    const CountedWait counted{DrainSite::RingFull};
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
@@ -230,6 +281,7 @@ void GpuSplit::Drain(DrainSite site) {
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     const BackIdleTrace::FrontWait idle_trace{WaitState(site)};
+    const CountedWait counted{site};
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
     // Everything consumed is not enough: the back submits deferred work (Scheduler::DeferFlush)
     // from its idle hook afterwards, and the caller may use the scheduler once this returns.
@@ -270,8 +322,8 @@ void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known) {
     if (semaphore_writes.size() >= semaphore_writes_limit) {
         // The words of releases the back ran hold their values in memory.
         const u64 done = consumed.load(std::memory_order_acquire);
-        std::erase_if(semaphore_writes,
-                      [done](const auto& entry) { return entry.second.position <= done; });
+        boost::unordered::erase_if(
+            semaphore_writes, [done](const auto& entry) { return entry.second.position <= done; });
         semaphore_writes_limit = std::max<size_t>(1024, semaphore_writes.size() * 2);
     }
     semaphore_writes.insert_or_assign(device_address & ~u64{3},
@@ -361,6 +413,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     }
     Nx2Profile::Scope scope{Nx2Profile::Zone::WriterWait};
     const BackIdleTrace::FrontWait idle_trace{WaitState(site)};
+    const CountedWait counted{site};
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
@@ -677,6 +730,10 @@ void GpuSplit::ReportAcquire() {
     const u64 drain_settings = take(stats.drain_settings);
     const u64 drain_word = take(stats.drain_word);
     const u64 drain_queued = take(stats.drain_queued);
+    const u64 queued_unknown = take(stats.queued_unknown);
+    const u64 queued_unknown_met = take(stats.queued_unknown_met);
+    const u64 trigger_not_met = take(stats.trigger_not_met);
+    const u64 trigger_not_met_twice = take(stats.trigger_not_met_twice);
     const u64 valve_drains = take(stats.valve_drains);
     const u64 polls = take(stats.polls);
     const u64 acquire_polls = take(stats.acquire_polls);
@@ -708,6 +765,22 @@ void GpuSplit::ReportAcquire() {
              "either: {} found while polling, {} found late in the OS wait",
              front_polls, front_sleeps, front_woken, front_stored, front_found_polling,
              front_found_late);
+    std::string sites;
+    for (size_t site = 0; site < drain_site_names.size(); ++site) {
+        const u64 count = take(stats.site_drains[site]);
+        const u64 ns = take(stats.site_drain_ns[site]);
+        if (count != 0) {
+            sites += fmt::format("{}{} {} ({:.1f} ms)", sites.empty() ? "" : ", ",
+                                 drain_site_names[site], count, static_cast<double>(ns) / 1e6);
+        }
+    }
+    LOG_INFO(HW_GPU,
+             "Front waits for the back in 10 s by site: {}; acquire methods not met without a "
+             "drain: {} ({} still not met after it, which drain again to release the fences); "
+             "drains for a queued release of unknown value (a reduction or a counter) to a word memory "
+             "already meets: {} of {}",
+             sites.empty() ? "none" : sites, trigger_not_met, trigger_not_met_twice,
+             queued_unknown_met, queued_unknown);
     const u64 mismatches = take(stats.mismatches);
     const u64 unlanded = take(stats.unlanded);
     const u64 late = take(stats.late);

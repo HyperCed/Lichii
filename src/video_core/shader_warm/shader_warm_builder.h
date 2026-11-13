@@ -130,6 +130,11 @@ struct Result {
     size_t skipped{};            ///< Programs that failed to extract or convert
 };
 
+/// Why a precache file must be built again: missing, of a cache version the emulator does not
+/// load, written by an older builder (WarmBuilderVersion) or changed since. Empty when it is
+/// current.
+std::optional<std::string> WarmFilesStale(const std::filesystem::path& warm_file);
+
 /// Builds the precache file for the game at `game_path` (any format the loader opens, Switch 2
 /// .nup first), from the user's own copy and keys, with no external tools. Runs on the calling
 /// thread; `progress` is called from it; stops early when `stop` is requested.

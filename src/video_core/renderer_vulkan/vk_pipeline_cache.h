@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -211,12 +210,13 @@ private:
     [[nodiscard]] bool KeyFitsDevice(const GraphicsPipelineCacheKey& key) const;
 
     /// The boot load of the v2 cache (LoadDiskResources): `log` read, its records built as jobs
-    /// of shader_jobs
-    void LoadPipelinesV2(u64 title_id, std::shared_ptr<const VideoCommon::ShaderCacheV2::LogFile> log,
+    /// of shader_jobs. Without `build_at_boot` it builds, prebuilds and lowers again nothing.
+    void LoadPipelinesV2(u64 title_id,
+                         std::shared_ptr<const VideoCommon::ShaderCacheV2::LogFile> log,
                          std::stop_token stop_loading,
                          const VideoCore::DiskResourceLoadCallback& callback,
                          std::chrono::steady_clock::time_point load_begin, bool precache,
-                         std::unordered_set<u64> precached_pipelines);
+                         std::unordered_set<u64> precached_pipelines, bool build_at_boot);
 
     /// Reads a v2 graphics record and translates its pipeline, left for Build(). Null when it
     /// doesn't translate, `incomplete` when the record lacks a value the translation reads.
@@ -337,7 +337,7 @@ private:
     std::atomic_bool flush_in_flight{};
 
     /// Requested first when the cache is destroyed, to stop a rewrite of the disk cache: Android
-    /// and yuzu_cmd load with a stop token that never stops
+    /// and lichii_cmd load with a stop token that never stops
     std::stop_source serialization_stop;
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;

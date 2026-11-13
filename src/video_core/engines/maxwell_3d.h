@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -27,6 +26,7 @@
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_list_grid.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/textures/texture.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -3216,6 +3216,9 @@ public:
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
+    /// List-fed grid macros (nx2_list_grid.h): the markers of the data RAM, which the compute
+    /// engine shares and stores them in (KeplerCompute::FrontTakeListGrid).
+    Nx2ListGrid::GridMarker grid_marker;
 
     bool ShouldExecute() const {
         return execute_on;
@@ -3280,7 +3283,14 @@ public:
     static bool IsFastDrawDeltaMethod(u32 method);
     /// A vertex stream's address, size or limit (not its stride or enable).
     static bool IsFastDrawVertexBuffer(u32 method);
+    /// A vertex attribute format, when vertex input is dynamic state.
+    static bool IsFastDrawVertexFormat(u32 method);
     void NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end);
+    /// Writes constant buffer data at `offset` (`bytes` within the buffer) through the buffer
+    /// CB_ADDRESS and CB_SIZE select, translated once per selection and memory map. False, having
+    /// done nothing, where the general path has to: the buffer isn't one mapped device range, it
+    /// can reach the texture or sampler headers, or the write lands on Switch 2 sparse memory.
+    bool WriteBoundConstantBuffer(u32 offset, const void* data, u32 bytes);
 
     /// Handles a write to the CB_DATA[i] register.
     void ProcessCBData(u32 value);
@@ -3398,6 +3408,18 @@ private:
     /// Device memory of the texture and sampler header tables (NoteFastDrawConstantData).
     VideoCommon::Nx2FastDraw::DeviceSpans fast_draw_header_spans;
     VideoCommon::Nx2FastDraw::DeviceSpans fast_draw_sampler_spans;
+
+    /// The constant buffer WriteBoundConstantBuffer last translated, and the state it read.
+    struct BoundConstantBuffer {
+        GPUVAddr address{};
+        u32 size{};
+        u64 map_serial{};
+        GPUVAddr tic{};
+        u64 tic_size{};
+        GPUVAddr tsc{};
+        u64 tsc_size{};
+        DAddr device{}; ///< 0: the general path writes its data
+    } bound_constant_buffer;
 
     VideoCore::RasterizerInterface* rasterizer = nullptr;
 

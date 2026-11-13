@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
@@ -256,8 +255,11 @@ struct GPU::Impl {
         gpu_thread.SubmitList(channel, std::move(entries), is_async);
     }
 
+    // Queued without waiting, also with synchronous GPU: callers hold the nx2:gpu region, GPU
+    // memory registry or address space lock, which the GPU thread takes when work queued earlier
+    // writes into a lazily backed sparse region (BackSparseWrite).
     void RunInOrder(std::function<void()>&& func) {
-        gpu_thread.Run(std::move(func), is_async);
+        gpu_thread.Run(std::move(func), true);
     }
 
     void MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func) {
@@ -267,7 +269,7 @@ struct GPU::Impl {
                 func();
                 pending_maps.Remove(id);
             },
-            is_async, true);
+            true, true);
     }
 
     bool IsMapPending(GPUVAddr gpu_addr, u64 size) const {

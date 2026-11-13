@@ -555,9 +555,9 @@ HaltReason ArmHvf::HandleDataAbort(Hvf::Vcpu& vcpu, u64 syndrome) {
     }
 
     auto& page_table = m_process->GetPageTable().GetBasePageTable();
-    const u64 page_address = address & ~Memory::YUZU_PAGEMASK;
+    const u64 page_address = address & ~Memory::LICHII_PAGEMASK;
     if (access == Access::Denied &&
-        std::as_const(page_table.GetImpl().entries)[address >> Memory::YUZU_PAGEBITS].Type() ==
+        std::as_const(page_table.GetImpl().entries)[address >> Memory::LICHII_PAGEBITS].Type() ==
             Common::PageType::Memory) {
         // The GPU no longer tracks the page, yet it kept a protection (a read trap disarmed after
         // the page left the cache leaves it read-only). Dynarmic's slow path accesses such pages
@@ -574,7 +574,7 @@ HaltReason ArmHvf::HandleDataAbort(Hvf::Vcpu& vcpu, u64 syndrome) {
             }
             if (True(perms & (write ? Common::MemoryPermission::Write
                                     : Common::MemoryPermission::Read))) {
-                m_space.Protect(page_address, Memory::YUZU_PAGESIZE, perms);
+                m_space.Protect(page_address, Memory::LICHII_PAGESIZE, perms);
                 return retry();
             }
         }
@@ -582,7 +582,7 @@ HaltReason ArmHvf::HandleDataAbort(Hvf::Vcpu& vcpu, u64 syndrome) {
 
     const bool gpu_cached =
         access == Access::Denied &&
-        std::as_const(page_table.GetImpl().entries)[address >> Memory::YUZU_PAGEBITS].Type() ==
+        std::as_const(page_table.GetImpl().entries)[address >> Memory::LICHII_PAGEBITS].Type() ==
             Common::PageType::RasterizerCachedMemory;
     // A store to a page the GPU caches goes through the emulator's memory, as Dynarmic's slow
     // path does: the caches learn of the write, and those that can let the page go, so the stores
@@ -606,7 +606,7 @@ HaltReason ArmHvf::HandleDataAbort(Hvf::Vcpu& vcpu, u64 syndrome) {
             }
         }
         g_stats.Count(g_stats.invalidated);
-        if (m_memory.InvalidateNCE(page_address, Memory::YUZU_PAGESIZE) &&
+        if (m_memory.InvalidateNCE(page_address, Memory::LICHII_PAGESIZE) &&
             m_space.Query(address, write) == Access::Allowed) {
             return retry();
         }
@@ -630,7 +630,7 @@ HaltReason ArmHvf::HandleDataAbort(Hvf::Vcpu& vcpu, u64 syndrome) {
                                                                        : "no access";
         const bool in_range = address < (1ULL << Hvf::AddressSpaceBits);
         const auto page_type = in_range ? std::as_const(page_table.GetImpl().entries)
-                                              [address >> Memory::YUZU_PAGEBITS].Type()
+                                              [address >> Memory::LICHII_PAGEBITS].Type()
                                         : Common::PageType::Unmapped;
         Kernel::KMemoryInfo info{};
         Kernel::Svc::PageInfo page_info{};
@@ -736,7 +736,7 @@ void ArmHvf::InvalidateCacheRange(u64 addr, std::size_t size) {
     // to hear about it, through any mapping of the pages.
     const u64 end = addr + size;
     while (addr < end) {
-        const u64 next = (std::min)(end, (addr & ~Memory::YUZU_PAGEMASK) + Memory::YUZU_PAGESIZE);
+        const u64 next = (std::min)(end, (addr & ~Memory::LICHII_PAGEMASK) + Memory::LICHII_PAGESIZE);
         if (u8* const pointer = m_memory.GetPointerSilent(addr)) {
             sys_icache_invalidate(pointer, next - addr);
         }

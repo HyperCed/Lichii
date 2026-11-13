@@ -13,11 +13,14 @@
 #include "common/cpu_features.h"
 #include "audio_core/audio_core.h"
 #include "common/fs/fs.h"
+#include "common/literals.h"
 #include "common/logging.h"
+#include "common/memory_detect.h"
 #include "common/nx2_sampler.h"
 #include "common/adpf.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "common/shutdown_progress.h"
 #include "common/string_util.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
@@ -64,6 +67,7 @@
 #include "core/hle/service/services.h"
 #include "core/hle/service/set/system_settings_server.h"
 #include "core/hle/service/sm/sm.h"
+#include "core/internal_network/local_redirect.h"
 #include "core/internal_network/network.h"
 #include "core/loader/loader.h"
 #include "core/loader/nx.h"
@@ -138,8 +142,9 @@ std::optional<u64> Switch2ProgramId(FileSys::ProgramMetadata& metadata,
     return metadata.GetTitleID();
 }
 
-// Detect the platform and program before initializing the kernel memory layout and guest clock:
-// the id of a Switch 2 program, or nothing for any other program.
+} // namespace
+
+// Detect the platform and program before initializing the kernel memory layout and guest clock.
 std::optional<u64> FindSwitch2Program(const FileSys::VirtualFile& file, u64 program_id,
                                       std::size_t program_index) {
     FileSys::ProgramMetadata metadata;
@@ -162,7 +167,8 @@ std::optional<u64> FindSwitch2Program(const FileSys::VirtualFile& file, u64 prog
     }
     const auto type = file != nullptr ? Loader::IdentifyFile(file) : Loader::FileType::Unknown;
     if (type == Loader::FileType::NX) {
-        return Loader::AppLoader_NX::ReadPlatform(file, program_id) == 2;
+        const auto found = Loader::AppLoader_NX::ReadProgramPlatform(file, program_id);
+        return found && found->platform == 2 ? std::optional{found->program_id} : std::nullopt;
     }
     if (type == Loader::FileType::XCI || type == Loader::FileType::XCZ) {
         const FileSys::XCI xci{file, program_id, program_index};
@@ -196,8 +202,6 @@ std::optional<u64> FindSwitch2Program(const FileSys::VirtualFile& file, u64 prog
     const auto npdm = dir != nullptr ? dir->GetFile("main.npdm") : nullptr;
     return Switch2ProgramId(metadata, npdm);
 }
-
-} // namespace
 
 struct System::Impl {
     explicit Impl(System& system)
@@ -299,15 +303,16 @@ struct System::Impl {
 
         timezone_service->SetDeviceLocationName(name);
 
-        u64 time_offset = 0;
+        s64 time_offset = 0;
         if (Settings::values.custom_rtc_enabled) {
             time_offset = Settings::values.custom_rtc_offset.GetValue();
         }
 
         const auto posix_time = std::chrono::system_clock::now().time_since_epoch();
-        const u64 current_time =
-            +std::chrono::duration_cast<std::chrono::seconds>(posix_time).count();
-        const u64 new_time = current_time + time_offset;
+        const s64 current_time =
+            std::chrono::duration_cast<std::chrono::seconds>(posix_time).count();
+        const s64 target_time = current_time + time_offset;
+        const u64 new_time = static_cast<u64>((std::max<s64>)(0, target_time));
 
         Service::PSC::Time::SystemClockContext context{};
         settings_service->SetUserSystemClockContext(context);
@@ -369,6 +374,20 @@ struct System::Impl {
     SystemResultStatus InitializeKernel(System& system) {
         LOG_DEBUG(Core, "initialized OK");
 
+        // ShutdownMainProcess releases it after a Switch 2 game; create it before the check below
+        // so an empty slot alone does not rerun the full Initialize.
+        if (guest_memory_released) {
+            guest_memory_released = false;
+            try {
+                device_memory.emplace();
+            } catch (const std::bad_alloc&) {
+                LOG_CRITICAL(Core, "Failed to allocate guest memory");
+            }
+            if (device_memory && !device_memory->buffer.BackingBasePointer()) {
+                device_memory.reset();
+            }
+        }
+
         // Setting changes may require a full system reinitialization (e.g., disabling multicore).
         ReinitializeIfNecessary(system);
         if (!device_memory) {
@@ -418,6 +437,17 @@ struct System::Impl {
         Kernel::KSystemControl::SetApplicationProgramId(switch2_program_id.value_or(0));
         Settings::SetCurrentProgramIsSwitch2(switch2_program);
         Settings::SetAstcRecompressionOverride(std::nullopt);
+        Network::LocalRedirect::Configure();
+
+        if (const auto ram = Common::GetHostRam();
+            switch2_program && Common::IsBelowSwitch2RamMinimum(ram)) {
+            using namespace Common::Literals;
+            LOG_WARNING(Core,
+                        "Low host RAM: {:.3g} GB {}; Switch 2 titles need at least 16 GB (32 GB "
+                        "recommended)",
+                        static_cast<f64>(ram.bytes) / f64{1_GiB},
+                        ram.installed ? "installed" : "usable");
+        }
 
         // Switch 2 titles size their heap from the total memory and need the 12 GiB layout. Set it
         // as a per-game value, so RestoreGlobalState brings back the configured layout afterwards.
@@ -561,6 +591,11 @@ struct System::Impl {
         // Reset per-game flags
         Settings::values.use_squashed_iterated_blend = false;
 
+        // Once powered off, services stop writing replies, so a guest thread whose IPC call
+        // completes would read its own request back and abort (2010-0212, a Userspace PANIC on
+        // every stop). Keep guest threads from running again first; the wait for running ones
+        // comes after the GPU has released any that it holds in host code.
+        kernel.RequestSuspendEmulation();
         is_powered_on = false;
         exit_locked = false;
         exit_requested = false;
@@ -573,14 +608,20 @@ struct System::Impl {
         kernel.SuspendEmulation(true);
         kernel.CloseServices();
         kernel.ShutdownCores();
+        // Each step done tells the frontend the teardown still moves (see
+        // Common::ShutdownProgress); the GPU's (pipeline caches) reports its own steps.
+        Common::NoteShutdownProgress();
         services.reset();
         service_manager.reset();
         fs_controller.Reset();
         cheat_engine.reset();
         core_timing.ClearPendingEvents();
         app_loader.reset();
+        Common::NoteShutdownProgress();
         audio_core.reset();
+        Common::NoteShutdownProgress();
         gpu_core.reset();
+        Common::NoteShutdownProgress();
         host1x_core.reset();
         perf_stats.reset();
         cpu_manager.Shutdown();
@@ -596,6 +637,14 @@ struct System::Impl {
 
         // Reset all glue registrations
         arp_manager.ResetAll();
+
+        // The guest RAM section keeps every page the game touched until it is destroyed (up to
+        // 12 GiB), and the next Load reuses it. Switch 2 only: Switch 1 keeps its behaviour.
+        // InitializeKernel creates it again, sized for the next game.
+        if (Settings::CurrentProgramIsSwitch2()) {
+            device_memory.reset();
+            guest_memory_released = true;
+        }
 
         LOG_DEBUG(Core, "Shutdown OK");
     }
@@ -649,6 +698,7 @@ struct System::Impl {
     std::optional<Core::PerfStats> perf_stats;
     std::optional<Tegra::Host1x::Host1x> host1x_core;
     std::optional<Core::DeviceMemory> device_memory;
+    bool guest_memory_released{};
     std::optional<AudioCore::AudioCore> audio_core;
     std::optional<Memory::CheatEngine> cheat_engine;
     std::optional<Tools::Freezer> memory_freezer;

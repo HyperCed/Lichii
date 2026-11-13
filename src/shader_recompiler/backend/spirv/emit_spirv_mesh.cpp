@@ -348,6 +348,11 @@ void EmitMeshPrologue(EmitContext& ctx) {
     const bool as_compute{ctx.runtime_info.mesh_as_compute};
     if (ctx.stage == Stage::Task) {
         if (!as_compute) {
+            // A task that culls all its threads never writes the mesh workgroup count, and the
+            // payload starts undefined: launching that many mesh workgroups hangs the GPU.
+            // Every invocation stores the zero (upstream 8e87cf5a66).
+            ctx.OpStore(PayloadWord(ctx, ctx.Const(1U)), ctx.u32_zero_value);
+            Barrier(ctx);
             return;
         }
     } else if (ctx.stage != Stage::Mesh) {

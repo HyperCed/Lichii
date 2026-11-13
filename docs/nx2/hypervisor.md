@@ -6,7 +6,7 @@ Hypervisor.framework instead of recompiling it with Dynarmic. It exists only in 
 Dynarmic; the log says why. A run that uses it logs `CPU backend: Hypervisor.framework`.
 
 The program must carry the `com.apple.security.hypervisor` entitlement
-(`dist/eglantine.entitlements`). The build signs `lichii` and `eden-cli` ad hoc with it; without
+(`dist/eglantine.entitlements`). The build signs `lichii` and `lichii-cmd` ad hoc with it; without
 it the VM is refused and Dynarmic is used.
 
 ## How it works

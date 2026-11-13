@@ -87,7 +87,7 @@ Three kinds of work, three places:
    is safe.
 3. **Existing renderer hooks.** The screenshot uses `RendererBase::RequestScreenshot`
    (`src/video_core/renderer_base.cpp:38`), the path the Qt screenshot hotkey uses
-   (`src/yuzu/bootmanager.cpp:819`). It is already safe to call from another thread, and the
+   (`src/lichii/bootmanager.cpp:819`). It is already safe to call from another thread, and the
    renderer fills the buffer at the next present (`renderer_vulkan.cpp:350`).
 
 The server thread waits for rasterizer-thread work with a timeout (5 s for screenshots and
@@ -394,7 +394,7 @@ Live switch classification, from the switches in `src/`:
 
 The core cannot save state. There is no serialisation of the kernel, services, the dynarmic and
 NCE CPU state, or the GPU caches, and Eden and yuzu never had it. The `saveState` in
-`src/yuzu/main_window.cpp` is Qt window geometry. Adding save states is a project of its own,
+`src/lichii/main_window.cpp` is Qt window geometry. Adding save states is a project of its own,
 not a tool. The practical substitute is a reproduction script: phase 2 input sequences, recorded
 once (`EDEN_NX2_KEY_RECORD` already records keys in `eden-cli`) and replayed after boot.
 

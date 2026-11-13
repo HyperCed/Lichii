@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
@@ -777,8 +776,16 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
         if (blacklist) {
             has_blacklisted = false;
         }
+        const ImageViewInOut* previous{};
         for (ImageViewInOut& view : views) {
-            view.id = VisitImageView(view.index, compute);
+            // An element repeating the one before (a handle table holding one shadow map in
+            // many elements, say) is the same view: visiting it again only prepares it again.
+            // Not once this pass has deleted image views (scaling an image down below does):
+            // that view may have gone with them.
+            view.id = previous != nullptr && previous->index == view.index && !has_deleted_images
+                          ? previous->id
+                          : VisitImageView(view.index, compute);
+            previous = &view;
             if (blacklist) {
                 if (view.blacklist && view.id != NULL_IMAGE_VIEW_ID) {
                     const ImageViewBase& image_view = slot_image_views[view.id];
@@ -856,7 +863,7 @@ void TextureCache<P>::MemoizeTextures(SampledTextureMemo& memo,
     const bool native_tiling = gpu_memory->UsesNativeTiling();
     // The descriptors are read through one host page each (see DescriptorTable::Read).
     const auto host_of = [&](GPUVAddr address, size_t size) -> const u8* {
-        if ((address & Core::Memory::YUZU_PAGEMASK) + size > Core::Memory::YUZU_PAGESIZE) {
+        if ((address & Core::Memory::LICHII_PAGEMASK) + size > Core::Memory::LICHII_PAGESIZE) {
             return nullptr;
         }
         return gpu_memory->GetPointer(address);
@@ -1867,7 +1874,7 @@ template <class P>
 std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImageView(
     const Tegra::FramebufferConfig& config, DAddr cpu_addr) {
     // TODO: Properly implement this
-    const auto it = page_table.find(cpu_addr >> YUZU_PAGEBITS);
+    const auto it = page_table.find(cpu_addr >> LICHII_PAGEBITS);
     if (it == page_table.end()) {
         return {};
     }
@@ -4008,7 +4015,7 @@ void TextureCache<P>::ReportMissingImagePage(ImageId image_id, const Image& imag
                  image_id.index, image.gpu_addr, image.guest_size_bytes,
                  static_cast<u32>(info.type), static_cast<u32>(info.format), info.size.width,
                  info.size.height, info.size.depth, info.resources.levels, info.resources.layers,
-                 static_cast<u32>(image.flags), page << YUZU_PAGEBITS, image.channel,
+                 static_cast<u32>(image.flags), page << LICHII_PAGEBITS, image.channel,
                  image.address_space, current_channel_id, current_address_space, spaces,
                  holders.empty() ? " none" : holders);
 }
@@ -4029,14 +4036,14 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
                 if (!std::exchange(reported_missing_page, true)) {
                     ReportMissingImagePage(image_id, image, page);
                 }
-                ASSERT_MSG(false, "Unregistering unregistered page={:#x}", page << YUZU_PAGEBITS);
+                ASSERT_MSG(false, "Unregistering unregistered page={:#x}", page << LICHII_PAGEBITS);
                 return;
             }
             std::vector<ImageId>& image_ids = page_it->second;
             const auto vector_it = std::ranges::find(image_ids, image_id);
             if (vector_it == image_ids.end()) {
                 ASSERT_MSG(false, "Unregistering unregistered image in page={:#x}",
-                           page << YUZU_PAGEBITS);
+                           page << LICHII_PAGEBITS);
                 return;
             }
             image_ids.erase(vector_it);
@@ -4049,14 +4056,14 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
         ForEachCPUPage(image.cpu_addr, image.guest_size_bytes, [this, map_id](u64 page) {
             const auto page_it = page_table.find(page);
             if (page_it == page_table.end()) {
-                ASSERT_MSG(false, "Unregistering unregistered page={:#x}", page << YUZU_PAGEBITS);
+                ASSERT_MSG(false, "Unregistering unregistered page={:#x}", page << LICHII_PAGEBITS);
                 return;
             }
             std::vector<ImageMapId>& image_map_ids = page_it->second;
             const auto vector_it = std::ranges::find(image_map_ids, map_id);
             if (vector_it == image_map_ids.end()) {
                 ASSERT_MSG(false, "Unregistering unregistered image in page={:#x}",
-                           page << YUZU_PAGEBITS);
+                           page << LICHII_PAGEBITS);
                 return;
             }
             image_map_ids.erase(vector_it);
@@ -4077,7 +4084,7 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
         ForEachCPUPage(cpu_addr, size, [this, image_id](u64 page) {
             const auto page_it = page_table.find(page);
             if (page_it == page_table.end()) {
-                ASSERT_MSG(false, "Unregistering unregistered page={:#x}", page << YUZU_PAGEBITS);
+                ASSERT_MSG(false, "Unregistering unregistered page={:#x}", page << LICHII_PAGEBITS);
                 return;
             }
             std::vector<ImageMapId>& image_map_ids = page_it->second;

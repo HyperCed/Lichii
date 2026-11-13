@@ -106,7 +106,7 @@ def main():
     else:
         pid = args.pid
         if pid is None:
-            found = subprocess.run(["pgrep", "-f", "MacOS/lichii|eden-cli"], capture_output=True,
+            found = subprocess.run(["pgrep", "-f", "MacOS/lichii|lichii-cmd"], capture_output=True,
                                    text=True).stdout.split()
             if not found:
                 sys.exit("lichii is not running; start a game first")

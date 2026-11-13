@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project SPDX-License-Identifier:
 # GPL-2.0-or-later
 
 if(DEFINED ENV{AZURECIREPO})
@@ -111,6 +110,7 @@ add_library(
     ${CMAKE_CURRENT_BINARY_DIR}/scm_rev.cpp
     scm_rev.h
     scope_exit.h
+    shutdown_progress.h
     spin_recursive_mutex.h
     scratch_buffer.h
     settings.cpp
@@ -177,7 +177,9 @@ set_source_files_properties(zbic_compression.cpp PROPERTIES
     COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wno-unused-function;-Wno-missing-declarations;-Wno-shadow>;$<$<CXX_COMPILER_ID:MSVC>:/wd4505;/wd5245>;$<$<CXX_COMPILER_ID:AppleClang,Clang>:-fno-profile-instr-use>")
 
 if(WIN32)
-    target_sources(common PRIVATE windows/timer_resolution.cpp
+    target_sources(common PRIVATE windows/crash_handler.cpp
+        windows/crash_handler.h
+        windows/timer_resolution.cpp
         windows/timer_resolution.h)
     target_link_libraries(common PRIVATE dxgi ntdll)
 endif()

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -29,7 +30,15 @@ public:
     static FileType IdentifyType(const FileSys::VirtualFile& nx_file);
     /// True when the archive holds a program with a base or a complete update to start.
     static bool IsBootable(const FileSys::VirtualFile& nx_file);
-    /// Platform of the application holding `program_id` (0: the first): 1 Switch 1, 2 Switch 2.
+    struct ProgramPlatform {
+        u64 program_id;
+        u8 platform;
+    };
+    /// The program the loader boots for `program_id` (0: the first application) and the platform
+    /// of its application: 1 Switch 1, 2 Switch 2.
+    static std::optional<ProgramPlatform> ReadProgramPlatform(const FileSys::VirtualFile& nx_file,
+                                                              u64 program_id);
+    /// Platform of the application holding `program_id` (0: the first), 0 when unreadable.
     static u8 ReadPlatform(const FileSys::VirtualFile& nx_file, u64 program_id);
 
     FileType GetFileType() const override {

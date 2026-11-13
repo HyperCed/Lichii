@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -732,6 +731,14 @@ struct Values {
     SwitchableSetting<bool> mkw_dynamic_fps{linkage, false, "mkw_dynamic_fps",
                                             Category::RendererAdvanced};
 
+    // Hyrule Warriors: Age of Imprisonment: 30 FPS at normal game speed while 60 can't be held,
+    // or always (core/hle/service/nx2_frame_interval.h).
+    SwitchableSetting<bool> hyrule_dynamic_fps{linkage, false, "hyrule_dynamic_fps",
+                                               Category::RendererAdvanced, Specialization::Default,
+                                               true, true};
+    SwitchableSetting<bool> hyrule_30fps{linkage, false, "hyrule_30fps", Category::RendererAdvanced,
+                                         Specialization::Default, true, true};
+
     SwitchableSetting<bool> use_reactive_flushing{linkage,
 #ifdef __ANDROID__
                                                   false,
@@ -935,6 +942,16 @@ struct Values {
                                               Category::Controls};
     SwitchableSetting<bool> enable_accurate_vibrations{linkage, false, "enable_accurate_vibrations",
                                                        Category::Controls};
+    // Only tested on Windows so far; on Linux (PipeWire) the haptics play through the speaker
+    Setting<bool> enable_dualsense_haptics{linkage,
+#ifdef _WIN32
+                                           true,
+#else
+                                           false,
+#endif
+                                           "enable_dualsense_haptics", Category::Controls};
+    Setting<bool> rumble_frequency_mapping{linkage, false, "rumble_frequency_mapping",
+                                           Category::Controls};
 
     SwitchableSetting<bool> motion_enabled{linkage, true, "motion_enabled", Category::Controls};
     Setting<std::string> udp_input_servers{linkage, "127.0.0.1:26760", "udp_input_servers",
@@ -1079,6 +1096,18 @@ struct Values {
                                         Category::Network};
     Setting<std::string> nextendo_client_id{linkage, "nxc_eHeSgpYwMkFV", "nextendo_client_id",
                                            Category::Network};
+    // Host redirect to a server the user runs (core/internal_network/local_redirect.h). Off: the
+    // online_redirect_* values are ignored.
+    Setting<bool> online_service_redirect{linkage, false, "online_service_redirect",
+                                          Category::Network};
+    Setting<std::string> online_redirect_hosts{linkage, std::string(), "online_redirect_hosts",
+                                               Category::Network};
+    Setting<std::string> online_redirect_server{linkage, std::string(), "online_redirect_server",
+                                                Category::Network};
+    Setting<std::string> online_redirect_ca{linkage, std::string(), "online_redirect_ca",
+                                            Category::Network};
+    Setting<bool> online_redirect_loopback_only{linkage, false, "online_redirect_loopback_only",
+                                                Category::Network};
 
     // WebService
     Setting<std::string> web_api_url{linkage, "api.ynet-fun.xyz", "web_api_url",

@@ -612,7 +612,7 @@ struct AppLoader_NX::Impl {
         // Built on first use: listing the game needs only its metadata.
         tree_romfs_dir = root->GetSubdirectory("romfs");
         LoadNacp(selected);
-        tree_executable = std::make_unique<AppLoader_DeconstructedRomDirectory>(exefs, true);
+        tree_executable = std::make_unique<AppLoader_DeconstructedRomDirectory>(exefs, true, false);
         tree = true;
         status = ResultStatus::Success;
     }
@@ -777,22 +777,42 @@ bool AppLoader_NX::IsBootable(const FileSys::VirtualFile& nx_file) {
     });
 }
 
-u8 AppLoader_NX::ReadPlatform(const FileSys::VirtualFile& nx_file, u64 program_id) {
+std::optional<AppLoader_NX::ProgramPlatform> AppLoader_NX::ReadProgramPlatform(
+    const FileSys::VirtualFile& nx_file, u64 program_id) {
     if (IdentifyType(nx_file) != FileType::NX) {
-        return 0;
+        return std::nullopt;
     }
     const auto catalog = FileSys::OpenNxCatalog(nx_file);
     if (!catalog) {
-        return 0;
+        return std::nullopt;
     }
+    // The same application and program Impl::Open boots.
     const auto& a = catalog->archive;
-    for (const auto& program : a.programs()) {
-        const auto& owner = a.applications()[program.application_index];
-        if (program_id == 0 || program.id == program_id || owner.id == program_id) {
-            return owner.platform;
+    for (const auto& owner : a.applications()) {
+        if (owner.platform != 1 && owner.platform != 2) {
+            continue;
+        }
+        const bool by_program = program_id != 0 && program_id != owner.id;
+        bool matches = !by_program;
+        std::optional<ProgramPlatform> found;
+        for (u32 p = owner.first_program;
+             p != Absent && p < owner.first_program + owner.program_count; ++p) {
+            const auto& program = a.programs()[p];
+            matches |= program.id == program_id;
+            if (!found && (by_program ? program.id == program_id : program.kind == 0)) {
+                found = ProgramPlatform{program.id, owner.platform};
+            }
+        }
+        if (matches) {
+            return found;
         }
     }
-    return 0;
+    return std::nullopt;
+}
+
+u8 AppLoader_NX::ReadPlatform(const FileSys::VirtualFile& nx_file, u64 program_id) {
+    const auto found = ReadProgramPlatform(nx_file, program_id);
+    return found ? found->platform : 0;
 }
 
 void AppLoader_NX::RegisterContent(FileSys::ManualContentProvider& provider) const {

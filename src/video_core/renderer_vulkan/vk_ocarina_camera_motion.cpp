@@ -649,11 +649,21 @@ vk::ImageView CreateOcarinaView(const Device& device, VkImage image, VkFormat fo
     });
 }
 
+// DLSS Frame Generation copies the motion vectors when they are tagged.
+VkImageUsageFlags FrameGenCopyUsage() {
+#ifdef EGLANTINE_STREAMLINE
+    return Streamline::FrameGenSession() ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0;
+#else
+    return 0;
+#endif
+}
+
 struct OcarinaFrameSlot {
     OcarinaFrameSlot(const Device& device, MemoryAllocator& allocator, VkExtent2D extent_)
         : extent{extent_}, motion{CreateOcarinaImage(
                               allocator, extent, MOTION_FORMAT, VK_IMAGE_USAGE_STORAGE_BIT |
-                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)},
+                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                  FrameGenCopyUsage())},
           motion_view{CreateOcarinaView(device, *motion, MOTION_FORMAT)},
           color{CreateOcarinaImage(allocator, extent, LIVE_COLOR_FORMAT,
                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)},
@@ -1005,6 +1015,7 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
             .reset = reset,
             .depth_inverted = false,
             .hdr = false,
+            .camera = StreamlineDlssUpscaler::Inputs::Camera{current, *transform},
         })) {
         state.scheduler.InvalidateState();
         return false;

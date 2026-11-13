@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -270,7 +269,7 @@ std::string GetUpdateVersionStringFromSlot(const ContentProvider* provider, u64 
     NACP nacp{nacp_file};
     return nacp.GetVersionString();
 }
-YUZU_NO_INLINE std::optional<u64> GetParentApplicationId(const ContentProvider* provider, u64 title_id) {
+LICHII_NO_INLINE std::optional<u64> GetParentApplicationId(const ContentProvider* provider, u64 title_id) {
     return provider == nullptr ? std::nullopt : provider->GetParentApplicationId(title_id);
 }
 } // Anonymous namespace
@@ -308,7 +307,7 @@ std::vector<std::string> PatchManager::GetDisabledAddons() const {
     return disabled;
 }
 
-VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const {
+VirtualDir PatchManager::PatchExeFS(VirtualDir exefs, bool apply_update) const {
     LOG_INFO(Loader, "Patching ExeFS for title_id={:016X}", title_id);
 
     if (exefs == nullptr)
@@ -436,9 +435,17 @@ VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const {
     }
 
     if (!update_disabled && update != nullptr && update->GetExeFS() != nullptr) {
-        LOG_INFO(Loader, "    ExeFS: Update ({}) applied successfully",
-                 FormatTitleVersion(content_provider.GetEntryVersion(update_tid).value_or(0)));
-        exefs = update->GetExeFS();
+        const auto version =
+            FormatTitleVersion(content_provider.GetEntryVersion(update_tid).value_or(0));
+        if (apply_update) {
+            LOG_INFO(Loader, "    ExeFS: Update ({}) applied successfully", version);
+            exefs = update->GetExeFS();
+        } else {
+            LOG_WARNING(Loader,
+                        "    ExeFS: Ignoring installed update ({}) for {:016X}: the container "
+                        "carries its own program and RomFS",
+                        version, title_id);
+        }
     }
 
     // LayeredExeFS
@@ -464,8 +471,10 @@ VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const {
             continue;
 
         auto exefs_dir = FindSubdirectoryCaseless(subdir, "exefs");
-        if (exefs_dir != nullptr)
+        if (exefs_dir != nullptr) {
+            LOG_INFO(Loader, "    ExeFS: LayeredExeFS mod {} (exefs)", subdir->GetName());
             layers.push_back(std::move(exefs_dir));
+        }
     }
     layers.push_back(exefs);
 
@@ -775,6 +784,7 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
 
     std::vector<VirtualDir> layers;
     std::vector<VirtualDir> layers_ext;
+    std::vector<std::string> mods;
     layers.reserve(patch_dirs.size() + 1);
     layers_ext.reserve(patch_dirs.size() + 1);
     for (const auto& subdir : patch_dirs) {
@@ -782,23 +792,20 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
             continue;
         }
 
-        auto romfs_dir = FindSubdirectoryCaseless(subdir, "romfs");
-        if (romfs_dir != nullptr)
-            layers.emplace_back(std::make_shared<CachedVfsDirectory>(std::move(romfs_dir)));
-
+        const auto layer = [&](std::vector<VirtualDir>& out, std::string_view kind) {
+            auto dir = FindSubdirectoryCaseless(subdir, kind);
+            if (dir == nullptr) {
+                return;
+            }
+            out.emplace_back(std::make_shared<CachedVfsDirectory>(std::move(dir)));
+            mods.push_back(fmt::format("{} ({})", subdir->GetName(), kind));
+        };
+        layer(layers, "romfs");
         // Support for romfslite introduced in Atmosphere 1.9.5
-        auto romfslite_dir = FindSubdirectoryCaseless(subdir, "romfslite");
-        if (romfslite_dir != nullptr)
-            layers.emplace_back(std::make_shared<CachedVfsDirectory>(std::move(romfslite_dir)));
-
-        auto ext_dir = FindSubdirectoryCaseless(subdir, "romfs_ext");
-        if (ext_dir != nullptr)
-            layers_ext.emplace_back(std::make_shared<CachedVfsDirectory>(std::move(ext_dir)));
-
+        layer(layers, "romfslite");
+        layer(layers_ext, "romfs_ext");
         if (type == ContentRecordType::HtmlDocument) {
-            auto manual_dir = FindSubdirectoryCaseless(subdir, "manual_html");
-            if (manual_dir != nullptr)
-                layers.emplace_back(std::make_shared<CachedVfsDirectory>(std::move(manual_dir)));
+            layer(layers, "manual_html");
         }
     }
 
@@ -826,6 +833,9 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
     }
 
     LOG_INFO(Loader, "    RomFS: LayeredFS patches applied successfully");
+    for (const auto& mod : mods) {
+        LOG_INFO(Loader, "    RomFS: LayeredFS mod {}", mod);
+    }
     romfs = std::move(packed);
 }
 
