@@ -11,6 +11,8 @@
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <mutex>
+#include <span>
 #include <vector>
 #include <tuple>
 #include <optional>
@@ -35,6 +37,7 @@
 #include "video_core/nx2_profile.h"
 #include "video_core/render_trace.h"
 #include "video_core/texture_cache/conversion.h"
+#include "video_core/texture_cache/formatter.h"
 #include "video_core/texture_cache/eviction_age.h"
 #include "video_core/texture_cache/host_memory_limit.h"
 #include "video_core/texture_cache/host_mip_limits.h"
@@ -50,6 +53,65 @@ namespace VideoCommon {
 [[nodiscard]] inline bool NativeDrawDiagnostics() {
     static const bool enabled = std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") != nullptr;
     return enabled;
+}
+
+/// EDEN_NX2_GPU_PROFILE: alias copies by destination and source image, logged every 10 s.
+inline void CountAliasCopy(const ImageBase& dst, const ImageBase& src,
+                           std::span<const ImageCopy> copies) {
+    struct Entry {
+        u64 count = 0;
+        u64 texels = 0;
+    };
+    static std::mutex mutex;
+    static std::map<std::string, Entry> entries;
+    static u64 window_start = 0;
+    u64 texels = 0;
+    for (const ImageCopy& copy : copies) {
+        texels += u64{copy.extent.width} * copy.extent.height * copy.extent.depth *
+                  static_cast<u64>(copy.dst_subresource.num_layers);
+    }
+    const auto describe = [](const ImageBase& image) {
+        const ImageInfo& info = image.info;
+        return fmt::format("{} {}x{}x{} {}L {}M at {:#x}+{:#x}", static_cast<u32>(info.format),
+                           info.size.width, info.size.height, info.size.depth,
+                           info.resources.layers, info.resources.levels, image.gpu_addr,
+                           image.guest_size_bytes);
+    };
+    std::string key = fmt::format("{} <- {}:", describe(dst), describe(src));
+    for (const ImageCopy& copy : copies) {
+        key += fmt::format(" [level {}->{} layer {}->{} x{} ({},{})->({},{}) {}x{}]",
+                           copy.src_subresource.base_level, copy.dst_subresource.base_level,
+                           copy.src_subresource.base_layer, copy.dst_subresource.base_layer,
+                           copy.dst_subresource.num_layers, copy.src_offset.x,
+                           copy.src_offset.y, copy.dst_offset.x, copy.dst_offset.y,
+                           copy.extent.width, copy.extent.height);
+    }
+    std::scoped_lock lock{mutex};
+    Entry& entry = entries[key];
+    ++entry.count;
+    entry.texels += texels;
+    const u64 now = Nx2Profile::Now();
+    if (window_start == 0) {
+        window_start = now;
+        return;
+    }
+    if (now - window_start < 10'000'000'000ULL) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - window_start) / 1e9;
+    window_start = now;
+    std::vector<std::pair<u64, std::string>> sorted;
+    for (const auto& [key, value] : entries) {
+        sorted.emplace_back(value.count, key);
+    }
+    std::sort(sorted.rbegin(), sorted.rend());
+    for (size_t i = 0; i < sorted.size() && i < 16; ++i) {
+        const Entry& value = entries[sorted[i].second];
+        LOG_INFO(HW_GPU, "Alias copies {:.0f}/s, {:.1f} Mtexels/s: {}",
+                 static_cast<double>(value.count) / seconds,
+                 static_cast<double>(value.texels) / 1e6 / seconds, sorted[i].second);
+    }
+    entries.clear();
 }
 
 using Tegra::Texture::TICEntry;
@@ -4303,6 +4365,9 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     });
     const auto& resolution = Settings::values.resolution_info;
     for (const AliasedImage* const aliased : aliased_images) {
+        if (Nx2Profile::Enabled()) {
+            CountAliasCopy(image, slot_images[aliased->id], aliased->copies);
+        }
         if (!resolution.active || !any_rescaled) {
             CopyImage(image_id, aliased->id, aliased->copies);
             continue;
