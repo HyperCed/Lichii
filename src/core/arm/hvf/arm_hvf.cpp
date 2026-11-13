@@ -24,6 +24,7 @@
 #include "core/core_timing.h"
 #include "core/device_memory.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/memory.h"
 
 namespace Core {
@@ -406,6 +407,12 @@ HaltReason ArmHvf::RunThread(Kernel::KThread* thread) {
     Load(vcpu);
     m_running.store(&vcpu);
 
+    namespace Stats = Kernel::Nx2ThreadStats;
+    u64 stats_start = 0;
+    if (Stats::g_enabled) {
+        Stats::BeginRun();
+        stats_start = m_system.CoreTiming().GetClockTicks();
+    }
     HaltReason hr{};
     while (true) {
         hr = static_cast<HaltReason>(m_halt.exchange(0));
@@ -428,6 +435,14 @@ HaltReason ArmHvf::RunThread(Kernel::KThread* thread) {
     }
 
     m_running.store(nullptr);
+    if (Stats::g_enabled) {
+        // The guest's own code is not split from the exits it makes: all of it counts as JIT.
+        const Stats::Exit exit = True(hr & HaltReason::SupervisorCall) ? Stats::Exit::Svc
+                                 : True(hr & HaltReason::BreakLoop)    ? Stats::Exit::Interrupt
+                                                                       : Stats::Exit::Other;
+        Stats::EndRun(thread, m_core_index, stats_start, m_system.CoreTiming().GetClockTicks(),
+                      exit, m_svc, 0, 0, 0);
+    }
     return hr;
 }
 
