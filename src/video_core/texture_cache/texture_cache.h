@@ -17,6 +17,7 @@
 #include <optional>
 #include <bit>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include "common/container/unordered_map.h"
 #include <boost/container/small_vector.hpp>
@@ -2441,6 +2442,7 @@ void TextureCache<P>::RefreshSparseTiles(Image& image) {
             runtime.TransitionImageLayout(image);
             return;
         }
+        LogSparseTileGrowth(image);
         // In parts: the data a large array can hold is hundreds of MiB, too much for one staging
         // buffer.
         constexpr size_t MaxUploadBytes = 64_MiB;
@@ -2467,6 +2469,30 @@ void TextureCache<P>::RefreshSparseTiles(Image& image) {
         runtime.InsertUploadMemoryBarrier();
         ++images_uploaded;
     }
+}
+
+template <class P>
+void TextureCache<P>::LogSparseTileGrowth(const Image& image) {
+    // Each 128 MiB an image's tiles grow by: how much of it the game maps, so a host tile shape
+    // that binds far more than that shows.
+    constexpr u64 Step = 128_MiB;
+    static std::unordered_map<GPUVAddr, u64> logged;
+    const u64 bound = ImageMemoryBytes(image);
+    u64& last = logged[image.gpu_addr];
+    if (bound < last + Step && bound + Step > last) {
+        return;
+    }
+    last = bound;
+    u64 guest = 0;
+    for (const auto& [offset, size] :
+         Tegra::Nx2SparseDataRanges(image.gpu_addr, image.guest_size_bytes)) {
+        guest += size;
+    }
+    LOG_INFO(HW_GPU, "Sparse tiles of {:#x} ({}x{}, {} layers, format {}): {} MiB bound for {} MiB "
+                     "the game maps",
+             image.gpu_addr, image.info.size.width, image.info.size.height,
+             image.info.resources.layers, static_cast<u32>(image.info.format), bound >> 20,
+             guest >> 20);
 }
 
 template <class P>

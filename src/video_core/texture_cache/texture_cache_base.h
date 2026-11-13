@@ -234,6 +234,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
 
     /// Image::BindTiles, counting what it binds in total_used_memory.
     bool BindSparseTiles(Image& image, std::span<const LevelRect> rects);
+    void LogSparseTileGrowth(const Image& image);
 
     /// Image::BackTilesWhole, counting what it binds in total_used_memory.
     bool BackSparseTilesWhole(Image& image);
