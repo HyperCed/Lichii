@@ -2499,6 +2499,39 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             layer_source_program = &programs[index];
         }
     }
+    if (!mesh_unsupported && device.IsExtMeshShaderSupported()) {
+        // Programs that need more workgroup memory than the device has take mesh emulation:
+        // MoltenVK keeps mesh outputs in threadgroup memory next to shared variables, and an
+        // Apple GPU's 32 KiB hold less than Switch 2 programs use.
+        const auto& limits{device.GetMeshShaderProperties()};
+        for (size_t index = 1; index < Maxwell::MaxShaderProgram && !mesh_unsupported; ++index) {
+            const Shader::IR::Program& program{programs[index]};
+            if (key.unique_hashes[index] == 0) {
+                continue;
+            }
+            if (program.stage == Shader::Stage::Task) {
+                mesh_unsupported = program.shared_memory_size > limits.maxTaskSharedMemorySize ||
+                                   program.mesh.payload_words * 4 > limits.maxTaskPayloadSize;
+            } else if (program.stage == Shader::Stage::Mesh) {
+                constexpr u64 LineBytes = 16;
+                const u64 outputs{program.mesh.max_vertices * program.mesh.vertex_lines.size() *
+                                      LineBytes +
+                                  program.mesh.max_primitives *
+                                      program.mesh.primitive_lines.size() * LineBytes};
+                mesh_unsupported =
+                    program.mesh.max_vertices > limits.maxMeshOutputVertices ||
+                    program.mesh.max_primitives > limits.maxMeshOutputPrimitives ||
+                    program.shared_memory_size + outputs >
+                        u64{limits.maxMeshSharedMemorySize} + limits.maxMeshOutputMemorySize;
+            }
+            if (mesh_unsupported) {
+                LOG_INFO(Render_Vulkan,
+                         "Pipeline {:016x}: program {:016x} needs more mesh workgroup memory than "
+                         "the device has ({} B shared); emulating its mesh stage",
+                         hash, key.unique_hashes[index], program.shared_memory_size);
+            }
+        }
+    }
     {
         // Fit the set before mesh fallback chooses its auxiliary buffer bindings: cutting arrays
         // can merge descriptors, so both their element counts and their binding counts can change.
