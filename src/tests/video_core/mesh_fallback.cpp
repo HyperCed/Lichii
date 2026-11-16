@@ -398,18 +398,18 @@ TEST_CASE("Mesh fallback reserves auxiliary storage buffers in the descriptor se
     REQUIRE_FALSE(FitsStorageBufferSetLimit((std::numeric_limits<size_t>::max)(), 4, 8));
 }
 
-TEST_CASE("Mesh fallback workgroup memory includes alignment padding",
+TEST_CASE("Mesh fallback counts aliased shared-memory views once",
           "[video_core][mesh_fallback]") {
-    Vulkan::WorkgroupMemoryLayout layout;
-    layout.Add(5, 1);
-    layout.Add(4, 4);
-    layout.Add(1, 16);
-    REQUIRE(layout.size == 17);
+    IR::Program program;
+    program.stage = Stage::Task;
+    program.mesh.payload_words = 1;
+    program.shared_memory_size = 16 * 1024;
+    Profile profile;
+    profile.support_explicit_workgroup_layout = true;
 
-    Vulkan::WorkgroupMemoryLayout task;
-    task.Add(24 * 1024, 4);
-    task.Add(12 * 1024, 4);
-    REQUIRE(task.size > 32 * 1024);
+    const u64 size{Vulkan::MeshFallbackWorkgroupMemorySize(program, profile)};
+    REQUIRE(size == 16 * 1024 + 16);
+    REQUIRE(size <= 32 * 1024);
 }
 
 namespace {

@@ -133,57 +133,6 @@ Shader::OutputTopology MaxwellToOutputTopology(Maxwell::PrimitiveTopology topolo
     }
 }
 
-u64 MeshFallbackWorkgroupMemorySize(const Shader::IR::Program& program,
-                                    const Shader::Profile& profile) {
-    WorkgroupMemoryLayout layout;
-    const auto add_shared_memory = [&](u64 element_size) {
-        const u64 elements{(u64{program.shared_memory_size} + element_size - 1) / element_size};
-        layout.Add(elements * element_size, element_size);
-    };
-
-    layout.Add(u64{(std::max)(program.mesh.payload_words, 1U)} * sizeof(u32), sizeof(u32));
-    if (program.stage == Shader::Stage::Mesh) {
-        const Shader::MeshInfo& mesh{program.mesh};
-        const auto div_ceil = [](u64 value, u64 divisor) {
-            return (value + divisor - 1) / divisor;
-        };
-        const u64 vertex_lines{mesh.vertex_lines.size()};
-        const u64 primitive_lines{mesh.primitive_lines.size()};
-        const u64 attribute_words{
-            (std::max)(div_ceil(mesh.max_vertices, 32) * vertex_lines * 32 +
-                           div_ceil(mesh.max_primitives, 32) * primitive_lines * 32,
-                       u64{1})};
-        const u64 map_elements{4 + u64{mesh.PrimitiveVertices()} * mesh.max_primitives};
-        layout.Add(attribute_words * sizeof(u32), sizeof(u32));
-        layout.Add(map_elements * sizeof(u32), sizeof(u32));
-        layout.Add(sizeof(u32), sizeof(u32));
-    }
-
-    if (program.shared_memory_size != 0) {
-        const bool explicit_layout{
-            profile.support_explicit_workgroup_layout &&
-            (!program.info.uses_int8 || profile.support_workgroup_layout_8bit_access) &&
-            (!program.info.uses_int16 || profile.support_workgroup_layout_16bit_access)};
-        if (explicit_layout) {
-            if (program.info.uses_int8 && profile.support_int8) {
-                add_shared_memory(1);
-            }
-            if (program.info.uses_int16 && profile.support_int16) {
-                add_shared_memory(2);
-            }
-            if (program.info.uses_int64 && profile.support_int64) {
-                add_shared_memory(8);
-            }
-            add_shared_memory(4);
-            add_shared_memory(8);
-            add_shared_memory(16);
-        } else {
-            add_shared_memory(4);
-        }
-    }
-    return layout.size;
-}
-
 Shader::CompareFunction MaxwellToCompareFunction(Maxwell::ComparisonOp comparison) {
     switch (comparison) {
     case Maxwell::ComparisonOp::Never_D3D:
