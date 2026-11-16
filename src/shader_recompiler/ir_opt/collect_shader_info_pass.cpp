@@ -698,6 +698,7 @@ void VisitUsages(Info& info, IR::Inst& inst) {
         break;
     case IR::Opcode::SharedAtomicExchange64:
         info.uses_int64_bit_atomics = true;
+        info.uses_shared_atomic_exchange64 = true;
         break;
     case IR::Opcode::GlobalAtomicInc32:
     case IR::Opcode::StorageAtomicInc32:

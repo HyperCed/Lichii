@@ -65,6 +65,19 @@ bool HasCapability(const std::vector<u32>& code, spv::Capability capability) {
     });
 }
 
+bool HasAtomicExchange(const std::vector<u32>& code, u32 width) {
+    std::unordered_set<u32> types;
+    const auto instructions{Instructions(code)};
+    for (const Instruction& inst : instructions) {
+        if (inst.op == spv::Op::OpTypeInt && inst.operands[1] == width) {
+            types.insert(inst.operands[0]);
+        }
+    }
+    return std::ranges::any_of(instructions, [&](const Instruction& inst) {
+        return inst.op == spv::Op::OpAtomicExchange && types.contains(inst.operands[0]);
+    });
+}
+
 bool HasExtension(const std::vector<u32>& code, std::string_view name) {
     return std::ranges::any_of(Instructions(code), [&](const Instruction& inst) {
         return inst.op == spv::Op::OpExtension &&
@@ -138,7 +151,7 @@ Profile MakeProfile() {
 std::vector<u32> EmitProgram(Stage stage, bool as_compute, bool with_task,
                              Profile profile = MakeProfile(), bool lane_id = false,
                              bool culled = false, const MeshInfo& mesh = TriangleMesh(),
-                             u32 shared_memory_size = 0) {
+                             u32 shared_memory_size = 0, bool shared_atomic_exchange64 = false) {
     ObjectPool<IR::Inst> pool;
     IR::Block block{pool};
     IR::Program program;
@@ -159,6 +172,12 @@ std::vector<u32> EmitProgram(Stage stage, bool as_compute, bool with_task,
     program.info.uses_local_invocation_id = true;
     IR::IREmitter ir{block};
     ir.Prologue();
+    if (shared_atomic_exchange64) {
+        program.info.uses_int64 = true;
+        program.info.uses_int64_bit_atomics = true;
+        program.info.uses_shared_atomic_exchange64 = true;
+        static_cast<void>(ir.SharedAtomicExchange(ir.Imm32(0), ir.Imm64(u64{1})));
+    }
     if (stage == Stage::Mesh) {
         const IR::U32 index{lane_id ? ir.LaneId() : ir.IsbeRead(ir.Imm32(0))};
         program.info.uses_subgroup_invocation_id = lane_id;
@@ -406,10 +425,21 @@ TEST_CASE("Mesh fallback estimates shared memory with the non-explicit layout",
     program.stage = Stage::Task;
     program.mesh.payload_words = 1;
     program.shared_memory_size = 16 * 1024;
+    Profile profile{MakeProfile()};
 
-    const u64 size{Vulkan::MeshFallbackWorkgroupMemorySize(program)};
+    const u64 size{Vulkan::MeshFallbackWorkgroupMemorySize(program, profile)};
     REQUIRE(size == 16 * 1024 + 4);
     REQUIRE(size <= 32 * 1024);
+
+    program.info.uses_shared_atomic_exchange64 = true;
+    profile.support_shared_int64_atomics = true;
+    profile.support_int64 = true;
+    profile.support_explicit_workgroup_layout = true;
+    REQUIRE(Vulkan::MeshFallbackWorkgroupMemorySize(program, profile) == 16 * 1024 + 8);
+    REQUIRE(Vulkan::SharedAtomicExchange64LockSize(program, profile, false) == 0);
+
+    program.stage = Stage::Mesh;
+    REQUIRE(Vulkan::SharedAtomicExchange64LockSize(program, profile, false) == 4);
 }
 
 TEST_CASE("Mesh and compute-mode task shaders disable explicit workgroup layout",
@@ -428,6 +458,25 @@ TEST_CASE("Mesh and compute-mode task shaders disable explicit workgroup layout"
                                            TriangleMesh(), SharedMemorySize));
     require_no_explicit_layout(EmitProgram(Stage::Task, true, true, profile, false, false,
                                            TriangleMesh(), SharedMemorySize));
+}
+
+TEST_CASE("Shared int64 exchanges remain atomic without explicit workgroup layout",
+          "[video_core][spirv][mesh_fallback]") {
+    Profile profile{MakeProfile()};
+    profile.support_explicit_workgroup_layout = true;
+    profile.support_shared_int64_atomics = true;
+    profile.support_int64 = true;
+    const std::vector<u32> code{EmitProgram(Stage::Task, true, true, profile, false, false,
+                                            TriangleMesh(), 16, true)};
+    Dump(code, "fallback-task-shared-atomic64");
+    REQUIRE_FALSE(HasCapability(code, spv::Capability::WorkgroupMemoryExplicitLayoutKHR));
+    REQUIRE(HasAtomicExchange(code, 32));
+    REQUIRE_FALSE(HasCapability(code, spv::Capability::Int64Atomics));
+
+    profile.support_shared_int64_atomics = false;
+    const std::vector<u32> fallback{EmitProgram(Stage::Task, true, true, profile, false, false,
+                                                TriangleMesh(), 16, true)};
+    REQUIRE_FALSE(HasAtomicExchange(fallback, 32));
 }
 
 namespace {

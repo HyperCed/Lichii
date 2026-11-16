@@ -704,6 +704,14 @@ void EmitContext::DefineSharedMemory(const IR::Program& program) {
     shared_memory_u32 = AddGlobalVariable(shared_memory_u32_type, spv::StorageClass::Workgroup);
     interfaces.push_back(shared_memory_u32);
 
+    if (profile.support_shared_int64_atomics && program.info.uses_shared_atomic_exchange64) {
+        const Id lock_pointer{TypePointer(spv::StorageClass::Workgroup, U32[1])};
+        shared_atomic_lock =
+            AddGlobalVariable(lock_pointer, spv::StorageClass::Workgroup,
+                              ConstantNull(U32[1]));
+        interfaces.push_back(shared_atomic_lock);
+    }
+
     const Id func_type{TypeFunction(void_id, U32[1], U32[1])};
     const auto make_function{[&](u32 mask, u32 size) {
         const Id loop_header{OpLabel()};

@@ -356,6 +356,7 @@ public:
     Id shared_memory_u64{};
     Id shared_memory_u32x2{};
     Id shared_memory_u32x4{};
+    Id shared_atomic_lock{};
 
     Id shared_memory_u32_type{};
 

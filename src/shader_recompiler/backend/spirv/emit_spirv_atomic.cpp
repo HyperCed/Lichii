@@ -157,7 +157,18 @@ Id EmitSharedAtomicExchange32(EmitContext& ctx, Id offset, Id value) {
 }
 
 Id EmitSharedAtomicExchange64(EmitContext& ctx, Id offset, Id value) {
-    if (ctx.profile.support_shared_int64_atomics && ctx.uses_explicit_workgroup_layout) {
+    if (!ctx.profile.support_shared_int64_atomics) {
+        LOG_WARNING(Shader_SPIRV, "Int64 atomics not supported, fallback to non-atomic");
+        const Id pointer_1{SharedPointer(ctx, offset, 0)};
+        const Id pointer_2{SharedPointer(ctx, offset, 1)};
+        const Id value_1{ctx.LoadShared(ctx.U32[1], pointer_1)};
+        const Id value_2{ctx.LoadShared(ctx.U32[1], pointer_2)};
+        const Id new_vector{ctx.OpBitcast(ctx.U32[2], value)};
+        ctx.StoreShared(pointer_1, ctx.OpCompositeExtract(ctx.U32[1], new_vector, 0U));
+        ctx.StoreShared(pointer_2, ctx.OpCompositeExtract(ctx.U32[1], new_vector, 1U));
+        return ctx.OpBitcast(ctx.U64, ctx.OpCompositeConstruct(ctx.U32[2], value_1, value_2));
+    }
+    if (ctx.uses_explicit_workgroup_layout) {
         const Id shift_id{ctx.Const(3U)};
         const Id index{ctx.OpShiftRightArithmetic(ctx.U32[1], offset, shift_id)};
         const Id pointer{
@@ -165,7 +176,27 @@ Id EmitSharedAtomicExchange64(EmitContext& ctx, Id offset, Id value) {
         const auto [scope, semantics]{AtomicArgs(ctx)};
         return ctx.OpAtomicExchange(ctx.U64, pointer, scope, semantics, value);
     }
-    LOG_WARNING(Shader_SPIRV, "Int64 atomics not supported, fallback to non-atomic");
+
+    // Non-explicit workgroup memory exposes only u32 words, so serialize the pair of accesses.
+    const Id scope{ctx.Const(static_cast<u32>(spv::Scope::Workgroup))};
+    const Id semantics{ctx.BarrierSemantics(spv::MemorySemanticsMask::AcquireRelease |
+                                             spv::MemorySemanticsMask::WorkgroupMemory)};
+    const Id lock_value{ctx.Const(1U)};
+    const Id loop_header{ctx.OpLabel()};
+    const Id continue_block{ctx.OpLabel()};
+    const Id merge_block{ctx.OpLabel()};
+    ctx.OpBranch(loop_header);
+    ctx.AddLabel(loop_header);
+    ctx.OpLoopMerge(merge_block, continue_block, spv::LoopControlMask::MaskNone);
+    ctx.OpBranch(continue_block);
+
+    ctx.AddLabel(continue_block);
+    const Id old_lock{ctx.OpAtomicExchange(ctx.U32[1], ctx.shared_atomic_lock, scope, semantics,
+                                           lock_value)};
+    const Id acquired{ctx.OpIEqual(ctx.U1, old_lock, ctx.u32_zero_value)};
+    ctx.OpBranchConditional(acquired, merge_block, loop_header);
+
+    ctx.AddLabel(merge_block);
     const Id pointer_1{SharedPointer(ctx, offset, 0)};
     const Id pointer_2{SharedPointer(ctx, offset, 1)};
     const Id value_1{ctx.LoadShared(ctx.U32[1], pointer_1)};
@@ -173,7 +204,11 @@ Id EmitSharedAtomicExchange64(EmitContext& ctx, Id offset, Id value) {
     const Id new_vector{ctx.OpBitcast(ctx.U32[2], value)};
     ctx.StoreShared(pointer_1, ctx.OpCompositeExtract(ctx.U32[1], new_vector, 0U));
     ctx.StoreShared(pointer_2, ctx.OpCompositeExtract(ctx.U32[1], new_vector, 1U));
-    return ctx.OpBitcast(ctx.U64, ctx.OpCompositeConstruct(ctx.U32[2], value_1, value_2));
+    const Id old_value{ctx.OpBitcast(ctx.U64, ctx.OpCompositeConstruct(ctx.U32[2], value_1,
+                                                                         value_2))};
+    ctx.OpAtomicExchange(ctx.U32[1], ctx.shared_atomic_lock, scope, semantics,
+                         ctx.u32_zero_value);
+    return old_value;
 }
 
 Id EmitSharedAtomicExchange32x2(EmitContext& ctx, Id offset, Id value) {

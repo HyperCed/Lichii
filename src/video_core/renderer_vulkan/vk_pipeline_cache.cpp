@@ -2762,10 +2762,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
             if (program.stage == Shader::Stage::Task) {
                 const u64 payload_bytes = u64{program.mesh.payload_words} * sizeof(u32);
+                const u64 lock_size{SharedAtomicExchange64LockSize(program, profile, false)};
+                const u64 shared_memory_size{
+                    lock_size == 0
+                        ? program.shared_memory_size
+                        : ((u64{program.shared_memory_size} + 3) & ~u64{3}) + lock_size};
                 mesh_unsupported =
-                    program.shared_memory_size > limits.maxTaskSharedMemorySize ||
+                    shared_memory_size > limits.maxTaskSharedMemorySize ||
                     payload_bytes > limits.maxTaskPayloadSize ||
-                    payload_bytes + program.shared_memory_size >
+                    payload_bytes + shared_memory_size >
                         limits.maxTaskPayloadAndSharedMemorySize;
             } else if (program.stage == Shader::Stage::Mesh) {
                 constexpr u64 LineBytes = 16;
@@ -2777,12 +2782,17 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                                     programs[1].stage == Shader::Stage::Task};
                 const u64 payload_bytes =
                     has_task ? u64{programs[1].mesh.payload_words} * sizeof(u32) : 0;
+                const u64 lock_size{SharedAtomicExchange64LockSize(program, profile, false)};
+                const u64 shared_memory_size{
+                    lock_size == 0
+                        ? program.shared_memory_size
+                        : ((u64{program.shared_memory_size} + 3) & ~u64{3}) + lock_size};
                 mesh_unsupported =
                     program.mesh.max_vertices > limits.maxMeshOutputVertices ||
                     program.mesh.max_primitives > limits.maxMeshOutputPrimitives ||
-                    program.shared_memory_size > limits.maxMeshSharedMemorySize ||
+                    shared_memory_size > limits.maxMeshSharedMemorySize ||
                     outputs > limits.maxMeshOutputMemorySize ||
-                    payload_bytes + program.shared_memory_size >
+                    payload_bytes + shared_memory_size >
                         limits.maxMeshPayloadAndSharedMemorySize ||
                     payload_bytes + outputs > limits.maxMeshPayloadAndOutputMemorySize;
             }
@@ -2844,7 +2854,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         for (size_t index = 1; index < Maxwell::MaxShaderProgram; ++index) {
             const bool emulated{index == mesh_index || (has_task && index == 1)};
             const u64 workgroup_memory_size{
-                emulated ? MeshFallbackWorkgroupMemorySize(programs[index]) : 0};
+                emulated ? MeshFallbackWorkgroupMemorySize(programs[index], profile) : 0};
             if (emulated && workgroup_memory_size > max_compute_shared_memory) {
                 LOG_WARNING(Render_Vulkan,
                             "Pipeline {:016x}: skipping mesh emulation because program {:016x} "
@@ -3590,13 +3600,37 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
         driver_id == VK_DRIVER_ID_ARM_PROPRIETARY || driver_id == VK_DRIVER_ID_MOLTENVK;
     const u32 max_shared_memory = device.GetMaxComputeSharedMemorySize();
-    if (needs_shared_mem_clamp && program.shared_memory_size > max_shared_memory) {
+    const u32 shared_atomic_lock_size{static_cast<u32>(
+        SharedAtomicExchange64LockSize(program, profile, false))};
+    if (shared_atomic_lock_size > max_shared_memory) {
+        LOG_WARNING(Render_Vulkan,
+                    "Compute shader {:#016x} needs a {}-byte shared atomic lock but the device "
+                    "supports only {} bytes of workgroup memory",
+                    key.unique_hash, shared_atomic_lock_size, max_shared_memory);
+        return {.failure = "Compute workgroup memory cannot hold the shared atomic lock"};
+    }
+    const u32 max_guest_shared_memory =
+        shared_atomic_lock_size == 0
+            ? max_shared_memory
+            : (max_shared_memory - shared_atomic_lock_size) & ~u32{3};
+    const u64 shared_memory_size{
+        (u64{program.shared_memory_size} + 3) & ~u64{3}};
+    if (!needs_shared_mem_clamp && shared_atomic_lock_size != 0 &&
+        shared_memory_size > max_guest_shared_memory) {
+        LOG_WARNING(Render_Vulkan,
+                    "Compute shader {:#016x} requests {} bytes of shared memory plus a {}-byte "
+                    "shared atomic lock, but the device supports only {} bytes",
+                    key.unique_hash, program.shared_memory_size, shared_atomic_lock_size,
+                    max_shared_memory);
+        return {.failure = "Compute workgroup memory exceeds the limit with the shared atomic lock"};
+    }
+    if (needs_shared_mem_clamp && program.shared_memory_size > max_guest_shared_memory) {
         LOG_WARNING(Render_Vulkan,
                     "Compute shader {:#016x} requests {}KB shared memory but device max is {}KB - clamping",
                     key.unique_hash,
                     program.shared_memory_size / 1024,
                     max_shared_memory / 1024);
-        program.shared_memory_size = max_shared_memory;
+        program.shared_memory_size = max_guest_shared_memory;
     }
     std::unique_ptr<ComputePipeline> pipeline;
     const u64 ir_bytes = emit_pools ? IrBytes(std::span(&program, 1)) : 0;

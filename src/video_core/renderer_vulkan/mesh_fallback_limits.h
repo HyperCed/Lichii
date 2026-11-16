@@ -7,6 +7,7 @@
 #include <cstdint>
 
 #include "shader_recompiler/frontend/ir/program.h"
+#include "shader_recompiler/profile.h"
 
 namespace Vulkan {
 
@@ -18,8 +19,25 @@ struct WorkgroupMemoryLayout {
     }
 };
 
+[[nodiscard]] inline std::uint64_t SharedAtomicExchange64LockSize(
+    const Shader::IR::Program& program, const Shader::Profile& profile,
+    bool mesh_as_compute) noexcept {
+    using Shader::Stage;
+
+    const bool has_non_block_workgroup_variables =
+        program.stage == Stage::Mesh || (program.stage == Stage::Task && mesh_as_compute);
+    const bool explicit_layout =
+        !has_non_block_workgroup_variables && profile.support_explicit_workgroup_layout &&
+        (!program.info.uses_int8 || profile.support_workgroup_layout_8bit_access) &&
+        (!program.info.uses_int16 || profile.support_workgroup_layout_16bit_access);
+    return program.info.uses_shared_atomic_exchange64 && profile.support_shared_int64_atomics &&
+                   !explicit_layout
+               ? sizeof(std::uint32_t)
+               : 0;
+}
+
 [[nodiscard]] inline std::uint64_t MeshFallbackWorkgroupMemorySize(
-    const Shader::IR::Program& program) {
+    const Shader::IR::Program& program, const Shader::Profile& profile) {
     using Shader::Stage;
 
     if (program.stage != Stage::Task && program.stage != Stage::Mesh) {
@@ -52,6 +70,10 @@ struct WorkgroupMemoryLayout {
         const std::uint64_t shared_size{
             (static_cast<std::uint64_t>(program.shared_memory_size) + 3) & ~std::uint64_t{3}};
         layout.Add(shared_size, sizeof(std::uint32_t));
+    }
+    const std::uint64_t lock_size{SharedAtomicExchange64LockSize(program, profile, true)};
+    if (lock_size != 0) {
+        layout.Add(lock_size, alignof(std::uint32_t));
     }
     return layout.size;
 }
