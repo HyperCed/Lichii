@@ -344,6 +344,8 @@ public:
     /// Updates the Render Targets if they can be rescaled
     /// @retval True if the Render Targets have been rescaled.
     bool RescaleRenderTargets();
+    void CountRescaleDecision(std::span<const ImageId> color_images, ImageId depth_image,
+                              bool rescaled);
 
     /// Update bound render targets and upload memory if necessary
     /// @param is_clear True when the render targets are being used for clears

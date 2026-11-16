@@ -2499,7 +2499,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             layer_source_program = &programs[index];
         }
     }
-    if (!mesh_unsupported && device.IsExtMeshShaderSupported()) {
+    // Experiment: EDEN_NX2_MESH_NATIVE_ALWAYS=1 hands every mesh pipeline to the driver.
+    static const bool native_always{std::getenv("EDEN_NX2_MESH_NATIVE_ALWAYS") != nullptr};
+    if (!native_always && !mesh_unsupported && device.IsExtMeshShaderSupported()) {
         // Programs that need more workgroup memory than the device has take mesh emulation:
         // MoltenVK keeps mesh outputs in threadgroup memory next to shared variables, and an
         // Apple GPU's 32 KiB hold less than Switch 2 programs use.

@@ -1166,8 +1166,84 @@ bool TextureCache<P>::RescaleRenderTargets() {
         set_rating(tmp_color_images[index]);
     }
     set_rating(tmp_depth_image);
+    if (Nx2Profile::Enabled() && Settings::values.resolution_info.active) {
+        CountRescaleDecision(tmp_color_images, tmp_depth_image, rescaled);
+    }
 
     return rescaled;
+}
+
+template <class P>
+void TextureCache<P>::CountRescaleDecision(std::span<const ImageId> color_images,
+                                           ImageId depth_image, bool rescaled) {
+    // EDEN_NX2_GPU_PROFILE with a resolution scale: every 10 s, the render target sets by how
+    // often they were bound, with whether they render scaled and what keeps them from it.
+    const auto reason = [this](ImageBase& image) -> const char* {
+        const ImageInfo& info = image.info;
+        if (!info.rescaleable) {
+            return info.resources.levels != 1 ? "has mip levels"
+                   : info.size.height <= 288  ? "288 high or less"
+                                              : "not rescaleable";
+        }
+        if (Settings::values.resolution_info.downscale && !info.downscaleable) {
+            return "512 high or less";
+        }
+        if (!ImageCanRescale(image)) {
+            return image.aliased_images.empty() ? "mip count" : "an alias cannot";
+        }
+        return nullptr;
+    };
+    struct Entry {
+        u64 binds = 0;
+    };
+    static std::map<std::string, Entry> entries;
+    static u64 window_start = 0;
+    std::string key;
+    const char* why = nullptr;
+    const auto add = [&](ImageId image_id, const char* kind) {
+        if (image_id == CORRUPT_ID || !image_id) {
+            return;
+        }
+        ImageBase& image = slot_images[image_id];
+        key += fmt::format("{}{} {}x{} {}L {}M{}", key.empty() ? "" : " + ", kind,
+                           image.info.size.width, image.info.size.height,
+                           image.info.resources.layers, image.info.resources.levels,
+                           image.aliased_images.empty() ? "" : " aliased");
+        if (const char* const image_why = reason(image); image_why != nullptr && why == nullptr) {
+            why = image_why;
+            key += fmt::format(" [{}]", image_why);
+        }
+    };
+    for (const ImageId image_id : color_images) {
+        add(image_id, "color");
+    }
+    add(depth_image, "depth");
+    if (key.empty()) {
+        return;
+    }
+    key = fmt::format("{}: {}", rescaled ? "scaled" : why ? "native" : "native (not rated yet)",
+                      key);
+    ++entries[key].binds;
+    const u64 now = Nx2Profile::Now();
+    if (window_start == 0) {
+        window_start = now;
+        return;
+    }
+    if (now - window_start < 10'000'000'000ULL) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - window_start) / 1e9;
+    window_start = now;
+    std::vector<std::pair<u64, std::string>> sorted;
+    for (const auto& [name, entry] : entries) {
+        sorted.emplace_back(entry.binds, name);
+    }
+    std::sort(sorted.rbegin(), sorted.rend());
+    for (size_t i = 0; i < sorted.size() && i < 24; ++i) {
+        LOG_INFO(HW_GPU, "Render targets {:.0f}/s {}",
+                 static_cast<double>(sorted[i].first) / seconds, sorted[i].second);
+    }
+    entries.clear();
 }
 
 template <class P>
