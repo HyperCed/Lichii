@@ -122,7 +122,6 @@ inline void CountAliasCopy(const ImageBase& dst, const ImageBase& src,
     }();
     return enabled;
 }
-}
 
 using Tegra::Texture::TICEntry;
 using Tegra::Texture::TSCEntry;
