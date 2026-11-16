@@ -398,6 +398,20 @@ TEST_CASE("Mesh fallback reserves auxiliary storage buffers in the descriptor se
     REQUIRE_FALSE(FitsStorageBufferSetLimit((std::numeric_limits<size_t>::max)(), 4, 8));
 }
 
+TEST_CASE("Mesh fallback workgroup memory includes alignment padding",
+          "[video_core][mesh_fallback]") {
+    Vulkan::WorkgroupMemoryLayout layout;
+    layout.Add(5, 1);
+    layout.Add(4, 4);
+    layout.Add(1, 16);
+    REQUIRE(layout.size == 17);
+
+    Vulkan::WorkgroupMemoryLayout task;
+    task.Add(24 * 1024, 4);
+    task.Add(12 * 1024, 4);
+    REQUIRE(task.size > 32 * 1024);
+}
+
 namespace {
 // A triangle mesh with a per-primitive generic (Generic1X), Layer and PrimitiveId.
 MeshInfo PerPrimitiveMesh() {

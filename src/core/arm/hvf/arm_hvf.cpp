@@ -46,6 +46,8 @@ constexpr u64 EcBreakpoint = 0x3c;
 constexpr u64 FscMask = 0x3f;
 constexpr u64 FscTranslationFaultFirst = 0x04;
 constexpr u64 FscTranslationFaultLast = 0x07;
+constexpr u64 FscPermissionFaultFirst = 0x0d;
+constexpr u64 FscPermissionFaultLast = 0x0f;
 
 // Trapped system registers, as the syndrome encodes them (op0, op2, op1, CRn, CRm).
 constexpr u64 SystemRegisterMask = 0x3ffc1e;
@@ -576,11 +578,22 @@ HaltReason ArmHvf::HandleDataAbort(Hvf::Vcpu& vcpu, u64 syndrome) {
         return HaltReason{};
     };
 
+    if (pc == m_fault_pc && address == m_fault_address) {
+        ++m_fault_repeats;
+    } else {
+        m_fault_pc = pc;
+        m_fault_address = address;
+        m_fault_repeats = 0;
+    }
+
     const Access access = m_space.Query(address, write);
     if (access == Access::Allowed) {
         const u64 fault_status = syndrome & FscMask;
-        if (fault_status >= FscTranslationFaultFirst &&
-            fault_status <= FscTranslationFaultLast) {
+        const bool stale_candidate =
+            (fault_status >= FscTranslationFaultFirst &&
+             fault_status <= FscTranslationFaultLast) ||
+            (fault_status >= FscPermissionFaultFirst && fault_status <= FscPermissionFaultLast);
+        if (stale_candidate && m_fault_repeats < 3) {
             g_stats.Count(g_stats.stale_tlb);
             return retry();
         }
@@ -593,14 +606,6 @@ HaltReason ArmHvf::HandleDataAbort(Hvf::Vcpu& vcpu, u64 syndrome) {
         return HaltReason::DataAbort;
     }
     g_stats.Count(write ? g_stats.write_fault : g_stats.read_fault);
-
-    if (pc == m_fault_pc && address == m_fault_address) {
-        ++m_fault_repeats;
-    } else {
-        m_fault_pc = pc;
-        m_fault_address = address;
-        m_fault_repeats = 0;
-    }
 
     auto& page_table = m_process->GetPageTable().GetBasePageTable();
     const u64 page_address = address & ~Memory::LICHII_PAGEMASK;

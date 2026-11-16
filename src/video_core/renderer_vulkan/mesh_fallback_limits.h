@@ -3,8 +3,17 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace Vulkan {
+
+struct WorkgroupMemoryLayout {
+    std::uint64_t size{};
+
+    constexpr void Add(std::uint64_t bytes, std::uint64_t alignment) noexcept {
+        size = ((size + alignment - 1) / alignment) * alignment + bytes;
+    }
+};
 
 // The mesh fallback adds storage-buffer bindings for its output (mesh-only), or
 // output, task payload, offsets and indirect arguments (task + mesh). Check
