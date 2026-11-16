@@ -137,7 +137,8 @@ Profile MakeProfile() {
 // With lane_id the mesh program writes its lane as the vertex's first attribute word.
 std::vector<u32> EmitProgram(Stage stage, bool as_compute, bool with_task,
                              Profile profile = MakeProfile(), bool lane_id = false,
-                             bool culled = false, const MeshInfo& mesh = TriangleMesh()) {
+                             bool culled = false, const MeshInfo& mesh = TriangleMesh(),
+                             u32 shared_memory_size = 0) {
     ObjectPool<IR::Inst> pool;
     IR::Block block{pool};
     IR::Program program;
@@ -148,6 +149,7 @@ std::vector<u32> EmitProgram(Stage stage, bool as_compute, bool with_task,
     program.syntax_list = {{{.block = &block}, IR::AbstractSyntaxNode::Type::Block},
                            {{}, IR::AbstractSyntaxNode::Type::Return}};
     program.mesh = mesh;
+    program.shared_memory_size = shared_memory_size;
     for (const u32 line : mesh.primitive_lines) {
         program.info.stores.Set(static_cast<IR::Attribute>(line), true);
     }
@@ -398,18 +400,34 @@ TEST_CASE("Mesh fallback reserves auxiliary storage buffers in the descriptor se
     REQUIRE_FALSE(FitsStorageBufferSetLimit((std::numeric_limits<size_t>::max)(), 4, 8));
 }
 
-TEST_CASE("Mesh fallback counts aliased shared-memory views once",
+TEST_CASE("Mesh fallback estimates shared memory with the non-explicit layout",
           "[video_core][mesh_fallback]") {
     IR::Program program;
     program.stage = Stage::Task;
     program.mesh.payload_words = 1;
     program.shared_memory_size = 16 * 1024;
-    Profile profile;
-    profile.support_explicit_workgroup_layout = true;
 
-    const u64 size{Vulkan::MeshFallbackWorkgroupMemorySize(program, profile)};
-    REQUIRE(size == 16 * 1024 + 16);
+    const u64 size{Vulkan::MeshFallbackWorkgroupMemorySize(program)};
+    REQUIRE(size == 16 * 1024 + 4);
     REQUIRE(size <= 32 * 1024);
+}
+
+TEST_CASE("Mesh and compute-mode task shaders disable explicit workgroup layout",
+          "[video_core][spirv][mesh_fallback]") {
+    Profile profile{MakeProfile()};
+    profile.support_explicit_workgroup_layout = true;
+    constexpr u32 SharedMemorySize = 16;
+    const auto require_no_explicit_layout = [](const std::vector<u32>& code) {
+        REQUIRE_FALSE(HasCapability(code, spv::Capability::WorkgroupMemoryExplicitLayoutKHR));
+        REQUIRE_FALSE(HasExtension(code, "SPV_KHR_workgroup_memory_explicit_layout"));
+    };
+
+    require_no_explicit_layout(EmitProgram(Stage::Mesh, false, false, profile, false, false,
+                                           TriangleMesh(), SharedMemorySize));
+    require_no_explicit_layout(EmitProgram(Stage::Mesh, true, true, profile, false, false,
+                                           TriangleMesh(), SharedMemorySize));
+    require_no_explicit_layout(EmitProgram(Stage::Task, true, true, profile, false, false,
+                                           TriangleMesh(), SharedMemorySize));
 }
 
 namespace {

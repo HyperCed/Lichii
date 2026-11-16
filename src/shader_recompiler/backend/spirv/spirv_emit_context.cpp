@@ -650,8 +650,11 @@ void EmitContext::DefineLocalMemory(const IR::Program& program) {
 }
 
 void EmitContext::DefineSharedMemory(const IR::Program& program) {
+    // These stages add non-Block Workgroup variables in DefineMesh.
+    const bool has_non_block_workgroup_variables =
+        stage == Stage::Mesh || (stage == Stage::Task && runtime_info.mesh_as_compute);
     uses_explicit_workgroup_layout =
-        profile.support_explicit_workgroup_layout &&
+        !has_non_block_workgroup_variables && profile.support_explicit_workgroup_layout &&
         (!program.info.uses_int8 || profile.support_workgroup_layout_8bit_access) &&
         (!program.info.uses_int16 || profile.support_workgroup_layout_16bit_access);
     if (program.shared_memory_size == 0) {

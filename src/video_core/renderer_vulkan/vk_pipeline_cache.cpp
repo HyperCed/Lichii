@@ -2844,7 +2844,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         for (size_t index = 1; index < Maxwell::MaxShaderProgram; ++index) {
             const bool emulated{index == mesh_index || (has_task && index == 1)};
             const u64 workgroup_memory_size{
-                emulated ? MeshFallbackWorkgroupMemorySize(programs[index], profile) : 0};
+                emulated ? MeshFallbackWorkgroupMemorySize(programs[index]) : 0};
             if (emulated && workgroup_memory_size > max_compute_shared_memory) {
                 LOG_WARNING(Render_Vulkan,
                             "Pipeline {:016x}: skipping mesh emulation because program {:016x} "
