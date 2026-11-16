@@ -48,7 +48,8 @@ public:
                              PipelineStatistics* pipeline_statistics,
                              VideoCore::ShaderNotify* shader_notify, const Shader::Info& info,
                              vk::ShaderModule spv_module, u64 shader_hash,
-                             std::function<vk::ShaderModule()> emit = {});
+                             std::vector<u8> kept_spirv,
+                             std::function<vk::ShaderModule(std::vector<u8>&)> emit = {});
 
     ~ComputePipeline();
 
@@ -67,9 +68,7 @@ public:
                                  std::optional<ByteAddressedShadow>& shadow,
                                  BindCommand* deferred_bind = nullptr);
 
-    static constexpr u64 Ocarina1440pShader = 0x6bd913e1f34e83ebULL;
-    /// The same output pass at 1:1, run at 1920x1080 in handheld with the Max Resolution add-on.
-    static constexpr u64 OcarinaFullSizeShader = 0xc033c3ddc9f0897bULL;
+    /// Whether the bindings fit an Ocarina upscale pass: one written image, no other writes.
     [[nodiscard]] bool CanReplaceOcarinaUpscale() const;
 
     bool IsBound() const noexcept {
@@ -78,6 +77,17 @@ public:
 
     [[nodiscard]] u64 ShaderHash() const noexcept {
         return shader_hash;
+    }
+
+    /// Whether the driver build has finished (or failed: then IsBound is false), so KeptSpirv() is
+    /// no longer written
+    [[nodiscard]] bool IsBuilt() const noexcept {
+        return is_built.load(std::memory_order_acquire);
+    }
+
+    /// The SPIR-V (zstd) the pipeline was built from; read it only once IsBuilt().
+    [[nodiscard]] const std::vector<u8>& KeptSpirv() const noexcept {
+        return kept_spirv;
     }
 
     /// Storage images written by the last configured dispatch
@@ -128,6 +138,7 @@ private:
     VideoCommon::ComputeUniformBufferSizes uniform_buffer_sizes{};
 
     vk::ShaderModule spv_module;
+    std::vector<u8> kept_spirv;
     vk::DescriptorSetLayout descriptor_set_layout;
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};

@@ -44,6 +44,9 @@ class FakeEmulator:
             return {"result": {"width": 1280, "height": 720, "png_base64": PNG}}
         if method == "capture_frame":
             return {"result": {"directory": self.capture_dir, "entries_total": 1}}
+        if method == "capture_bundle":
+            return {"result": {"path": "/logs/bug-reports/lichii-bug.zip", "bytes": 1000,
+                               "dropped": []}}
         if method == "read_memory":
             return {"result": {"address": request["params"]["address"], "hex": "0000803f"}}
         if method == "read_gpu_memory":
@@ -102,9 +105,10 @@ class AdapterTest(unittest.TestCase):
         names = [tool["name"] for tool in self.adapter.handle({"id": 2, "method": "tools/list"})
                  ["result"]["tools"]]
         self.assertEqual(names, ["status", "frame_times", "screenshot", "log_tail", "log_filter", "capture_frame",
-                                 "capture_image", "reject_shaders", "sample", "read_memory",
+                                 "capture_image", "capture_bundle", "reject_shaders", "sample", "read_memory",
                                  "search_memory", "read_gpu_memory", "input",
-                                 "input_sequence", "host_timing"])
+                                 "input_sequence", "host_timing", "trace_record",
+                                 "trace_stop", "trace_status"])
         self.assertEqual(self.adapter.handle({"id": 3, "method": "bogus"})["error"]["code"], -32601)
 
     def test_frame_times_is_forwarded(self):
@@ -120,6 +124,15 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(debug_mcp.default_timeout("frame_times", {}), 6)
         self.assertEqual(debug_mcp.default_timeout("frame_times", {"seconds": 59.5}), 61)
         self.assertEqual(debug_mcp.default_timeout("capture_frame", {}), 120)
+
+    def test_capture_bundle_is_forwarded(self):
+        arguments = {"description": "white sky", "size_limit_mib": 8}
+        result = self.call("capture_bundle", arguments)
+        self.assertFalse(result["isError"])
+        self.assertEqual(json.loads(result["content"][0]["text"])["path"],
+                         "/logs/bug-reports/lichii-bug.zip")
+        self.assertEqual(self.fake.requests[-1]["params"], arguments)
+        self.assertEqual(debug_mcp.default_timeout("capture_bundle", {}), 90)
 
     def test_status_is_forwarded(self):
         result = self.call("status", {"fps_window_ms": 0})

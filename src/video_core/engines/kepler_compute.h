@@ -22,7 +22,6 @@
 #include "video_core/game_dlss_status.h"
 #include "video_core/macro.h"
 #include "video_core/native_qmd.h"
-#include "video_core/nx2_list_grid.h"
 #include "video_core/textures/texture.h"
 
 namespace Core {
@@ -33,8 +32,16 @@ namespace VideoCommon {
 class GpuSplit;
 }
 
+namespace VideoCommon::GpuTrace {
+struct StateAccess;
+}
+
 namespace Tegra {
 class MemoryManager;
+}
+
+namespace Tegra::Nx2ListIndirect {
+class ComputeFront;
 }
 
 namespace VideoCore {
@@ -59,6 +66,8 @@ extern std::atomic<u32> g_nx2_trace_draws_after_upscale;
     (offsetof(Tegra::Engines::KeplerCompute::LaunchParams, field_name) / sizeof(u32))
 
 class KeplerCompute final : public EngineInterface {
+    friend struct ::VideoCommon::GpuTrace::StateAccess;
+
 public:
     explicit KeplerCompute(MemoryManager& memory_manager);
     ~KeplerCompute();
@@ -250,9 +259,11 @@ public:
     std::optional<GPUVAddr> GetIndirectComputeAddress() const {
         return indirect_compute;
     }
-    /// The dispatch takes its grid from a list's kept words (nx2_list_grid.h): their keep id.
-    std::optional<u64> GetKeptGrid() const {
-        return kept_grid;
+
+    /// The slot of GPU-written list words (Nx2ListIndirect) the dispatch being made takes its
+    /// group counts from, indirectly: its QMD's grid is the slot's placeholders.
+    std::optional<u32> GetIndirectListSlot() const {
+        return indirect_list_slot;
     }
 
     bool IsNativeMode() const { return native_mode; }
@@ -274,46 +285,32 @@ public:
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending,
                               const GPUVAddr* segment);
-    /// List-fed grid macros (nx2_list_grid.h): if a call of macro `method`, none begun, is one
-    /// the front takes without reading its three parameters, the keep id of its list, whose kept
-    /// slot it claimed (Nx2ListGrid::ClaimSlot).
-    std::optional<u64> FrontClaimListGrid(VideoCommon::GpuSplit& split, u32 method);
-    /// Takes that call: the parameters are the GPU-written words at `address`. The data RAM gets
-    /// markers for them, and the back keeps a copy of the words. Verify mode: `real` are the
-    /// words read the old way, else empty.
-    void FrontTakeListGrid(VideoCommon::GpuSplit& split, u32 method, u64 keep_id,
-                           GPUVAddr address, const Nx2ListGrid::ListReader& reader,
-                           std::span<const u32> real);
-    /// Where the channel tracks the markers of the data RAM it shares with its 3D engine.
-    void SetGridMarker(Nx2ListGrid::GridMarker* marker) {
-        grid_marker = marker;
-    }
+    /// The front, at a GPU-written list of `count` words that are all the parameters of the call
+    /// of macro method `method` about to start: whether the call takes the words as the
+    /// placeholders of `slot` (Nx2ListIndirect), the back's copy of them, instead of the words.
+    bool FrontTakeListWords(VideoCommon::GpuSplit& split, u32 method, u32 count, u32 slot);
 
 private:
     struct FrontState;
     FrontState& Front(VideoCommon::GpuSplit& split);
     void ReleaseFront();
     void FrontApply(FrontState& state, u32 method, u32 argument);
+    /// `last_call`: the method's last word (the back's is_last_call; macro writes are their own).
+    void FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                         bool last_call);
+    void FrontNoteUpload(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                         bool last_call);
     void FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& state, u32 control);
+    void FrontInlineQmd(VideoCommon::GpuSplit& split, const FrontState& state, u32 last_word);
+    void FrontQmdCheck(VideoCommon::GpuSplit& split);
     MacroEngine& FrontMacroEngine(FrontState& state);
     std::span<u32> FrontMacroPositions(FrontState& state);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
-    struct FrontMacro;
-    /// The macro at `start` of `engine`'s current code: its CodeHash and, for an HleMacros
-    /// entry, where it stores its parameters.
-    const FrontMacro& FrontMacroInfo(FrontState& state, const MacroEngine& engine, u32 start);
-    /// Tells the back that the word at `address` will carry `marker`, to patch from its kept copy.
-    void FrontExpectKeptWord(GPUVAddr address, u32 marker);
-    /// Before a macro runs while markers are live: runs it dry and gives it the real words
-    /// unless it only moves the markers (Nx2ListGrid::Admit).
-    void FrontGuardListGrid(VideoCommon::GpuSplit& split, FrontState& state, MacroEngine& engine,
-                            u32 start);
-    /// Before the kept slot of list `keep_id` is reused (Nx2ListGrid::SlotOwner::evict).
-    bool FrontEvictList(u64 keep_id);
     std::unique_ptr<FrontState> front;
     bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
 
     bool DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor);
+    bool BypassOotBaseNetwork();
     void ProcessNativeReportSemaphore(u32 argument);
     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
     /// Texture descriptor that the handle at `offset` in constant buffer 0 selects.
@@ -328,6 +325,8 @@ private:
     void CaptureFireEmblemJitter();
     bool FinishDlssEvaluation();
     void CheckDlssNetwork();
+    /// Whether the network failed its checks for the rest of the session: its passes are skipped.
+    [[nodiscard]] bool DlssNetworkDroppedForGood() const;
     [[nodiscard]] VideoCore::GameDlssReason GameDlssBlocker() const;
     void UpdateGameDlssStatus(bool complete, VideoCore::GameDlssReason blocker);
     std::pair<std::vector<u32>, std::vector<u32>> NativeImageHandles(GPUVAddr program);
@@ -344,14 +343,17 @@ private:
         u32 clean_evaluations{};
         bool native{};
         /// Health checks of the network's output against its input (CheckDlssNetwork): whether
-        /// this backend has them, good and bad results in a row, and why the network failed them
-        /// (None while it hasn't; then the replacement upscale draws the output for the session).
+        /// this backend has them, good and bad results in a row, why the network failed them
+        /// (None while it hasn't; then the replacement upscale draws the output) and how often it
+        /// was dropped for mismatched output (it is shown again once its output checks out, up
+        /// to DLSS_NETWORK_MAX_DROPS times).
         bool checked{};
         u32 good_checks{};
         u32 bad_checks{};
         VideoCore::GameDlssReason failure{};
-        /// Programs of evaluations that reached their output pass; they are skipped only after
-        /// the network fails its health checks.
+        u32 drops{};
+        /// Programs of evaluations that reached their output pass; they are skipped only once
+        /// the network is dropped for good (DlssNetworkDroppedForGood).
         std::unordered_set<u64> programs;
         /// This evaluation's programs and dispatches so far. Its programs join `programs` only
         /// at its output pass, so compute work after a look-alike first pass keeps running.
@@ -422,13 +424,12 @@ private:
         u32 copy_size;
         bool was_dirty;
     };
+    static constexpr size_t MaxPendingUploads = 4096;
     std::vector<UploadInfo> uploads;
     std::optional<GPUVAddr> indirect_compute{};
-    std::optional<u64> kept_grid{};
-    /// The lists the grid markers of the QMD read last stand for (Nx2ListGrid::QmdWordList), 0
-    /// for a word that is no marker. Set by the QMD read before its dispatch.
-    std::array<u64, 3> qmd_grid_lists{};
-    Nx2ListGrid::GridMarker* grid_marker{};
+    std::optional<u32> indirect_list_slot{};
+    /// The front's GPU-written list words in this engine's macros (Nx2ListIndirect).
+    std::unique_ptr<Nx2ListIndirect::ComputeFront> list_front;
 };
 
 #define ASSERT_REG_POSITION(field_name, position)                                                  \

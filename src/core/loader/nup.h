@@ -11,6 +11,7 @@
 #include "core/loader/loader.h"
 
 namespace FileSys {
+class ManualContentProvider;
 class NACP;
 class NupContainer;
 } // namespace FileSys
@@ -19,7 +20,7 @@ namespace Loader {
 
 /// Loads a NUP (NX Package) container: loose ExeFS/RomFS trees for a base
 /// program plus its updates in one file. The newest update package is layered
-/// over the base; add-on content packages are recognized but not yet mounted.
+/// over the base; add-on content packages are served as installed add-ons.
 class AppLoader_NUP final : public AppLoader {
 public:
     explicit AppLoader_NUP(FileSys::VirtualFile file_);
@@ -39,6 +40,9 @@ public:
     }
 
     LoadResult Load(Kernel::KProcess& process, Core::System& system) override;
+
+    /// Adds the container's add-ons for this application to the provider, newest version each.
+    void RegisterContent(FileSys::ManualContentProvider& provider) const;
 
     ResultStatus VerifyIntegrity(std::function<bool(size_t, size_t)> progress_callback) override;
 

@@ -1,7 +1,7 @@
 # Game-DLSS replacement
 
 The Vulkan renderer can replace a recognized game-DLSS evaluation with NVIDIA DLSS on
-Windows, then AMD FSR 3.1.4 if NVIDIA DLSS is disabled or unavailable. FSR uses AMD's
+Windows, then AMD FSR 3.1.6 if NVIDIA DLSS is disabled or unavailable. FSR uses AMD's
 eight temporal-upscaling passes, including depth, motion, history and optional RCAS.
 This is separate from the presentation filters that scale the finished window image.
 
@@ -45,11 +45,17 @@ the game keeps its own pass whenever DLSS is off, unavailable or fails to start.
 `EDEN_NX2_DLSS_REPLACEMENT=fsr` explicitly enables FSR; `native` disables both replacements;
 `dlss` asks for DLSS as its setting does.
 
-- Max Resolution add-on off: the 3/4-scale pass (`e40f5efb5480e692`; `ef542df87cacfe9e` on the
-  Linux RADV build, same contract) is replaced and FSR/DLSS
+The passes are recognised by native program key (`FindOcarinaUpscalePass` in
+`src/video_core/ocarina_upscale.h`), which lowering changes leave alone. Passes no capture has
+shown the native program of yet (`ef542df87cacfe9e`, `4c1ae2fe58f30a97`, `c033c3ddc9f0897b`) are
+matched by shader hash, and stop matching when the lowering of their program changes.
+
+- Max Resolution add-on off: the 3/4-scale pass (native program `6f9367bd41dc0b58`, shader
+  `e40f5efb5480e692`; also shader `ef542df87cacfe9e`, same contract) is replaced and FSR/DLSS
   writes the game's output size (1080p to 1440p docked, 810p to 1080p handheld).
-- Max Resolution add-on on, docked: the full-size pass (`6bd913e1f34e83eb`) at 2560x1440 is
-  replaced by a 3840x2160 temporal image. The game still finishes its 1440p frame. At presentation,
+- Max Resolution add-on on, docked: the full-size pass (native program `da6df3e54c716df2`,
+  shader `6bd913e1f34e83eb`) at 2560x1440 is replaced by a 3840x2160 temporal image. The game
+  still finishes its 1440p frame. At presentation,
   the HUD is taken from the difference between that frame and a 1440p copy of the temporal scene,
   and composited over the 4K scene. The 4K image skips the presentation's post-processing and
   upscale filters.
@@ -156,8 +162,9 @@ from the upstream implementation remain available for diagnostic comparisons.
 ## Build and distribution
 
 FSR needs no external runtime. Keep `externals/FidelityFX-SDK/LICENSE.txt` and its attribution
-with distributions. The vendored files are unmodified AMD MIT sources from FidelityFX SDK
-v1.1.4, commit `c6efa6bf7f2027b3ec94f28578bb5965eabb9e55`.
+with distributions. The vendored files are unmodified AMD MIT sources: the FSR 3.1.6 GPU code
+from AMD FSR SDK v2.4.0, commit `7539ae8b6568ad29ed78a753404351daf3b5cca7`, and the GLSL passes
+and callbacks from FidelityFX SDK v1.1.4, commit `c6efa6bf7f2027b3ec94f28578bb5965eabb9e55`.
 
 For the optional Windows NVIDIA path, obtain only the MIT Streamline headers and license
 from NVIDIA-RTX/Streamline tag `v2.14.16`, commit

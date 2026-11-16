@@ -90,6 +90,7 @@ Values values;
 
 namespace {
 std::atomic<u32> nvidia_dlss_runtime_options{};
+std::atomic<u32> applied_ocarina_render_scale{};
 }
 
 void RefreshNvidiaDlssRuntimeSettings() {
@@ -97,6 +98,29 @@ void RefreshNvidiaDlssRuntimeSettings() {
         static_cast<u32>(values.nvidia_dlss_quality.GetValue()) |
             (static_cast<u32>(values.nvidia_dlss_preset.GetValue()) << 8),
         std::memory_order_relaxed);
+}
+
+std::optional<NvidiaDlssQuality> OcarinaDlssRenderScale() {
+    const auto quality = values.nvidia_dlss_quality.GetValue();
+    if (!values.nvidia_dlss.GetValue() || !IsDockedMode() ||
+        (quality != NvidiaDlssQuality::Balanced && quality != NvidiaDlssQuality::Performance &&
+         quality != NvidiaDlssQuality::UltraPerformance)) {
+        return std::nullopt;
+    }
+    return quality;
+}
+
+void SetAppliedOcarinaRenderScale(std::optional<NvidiaDlssQuality> quality) {
+    applied_ocarina_render_scale.store(quality ? static_cast<u32>(*quality) + 1 : 0,
+                                       std::memory_order_relaxed);
+}
+
+std::optional<NvidiaDlssQuality> AppliedOcarinaRenderScale() {
+    const u32 value = applied_ocarina_render_scale.load(std::memory_order_relaxed);
+    if (value == 0) {
+        return std::nullopt;
+    }
+    return static_cast<NvidiaDlssQuality>(value - 1);
 }
 
 NvidiaDlssRuntimeSettings GetNvidiaDlssRuntimeSettings() {
@@ -255,6 +279,10 @@ void SetCurrentProgramIsSwitch2(bool is_switch2) {
 
 bool ReactiveFlushing() {
     return values.use_reactive_flushing.GetValue() || values.force_reactive_flushing;
+}
+
+bool SkipCpuInnerInvalidation() {
+    return values.skip_cpu_inner_invalidation.GetValue() && !values.keep_cpu_inner_invalidation;
 }
 
 bool CurrentProgramIsSwitch2() {

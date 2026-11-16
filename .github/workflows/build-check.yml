@@ -67,7 +67,7 @@ jobs:
             libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev \
             spirv-tools spirv-headers libusb-1.0-0-dev \
             libboost-dev libboost-fiber-dev libboost-context-dev \
-            libopus-dev libasound2-dev ccache pipx \
+            libopus-dev libasound2-dev ccache pipx mesa-vulkan-drivers \
             libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
             libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
           pipx install cmake==4.4.4
@@ -130,15 +130,26 @@ jobs:
       - name: Test debug adapter
         run: python3 tools/nx2/test_debug_mcp.py
 
+      # docs/nx2/gpu-trace.md: the corpus replays headless on Mesa's CPU Vulkan driver.
+      - name: Replay GPU traces on lavapipe
+        run: |
+          python3 tools/nx2/test_trace_replay.py
+          python3 -I tools/nx2/trace_replay.py check --cli build/bin/eden-cli \
+            --corpus tests/gpu_traces/corpus.json
+
       - name: Test cache metrics and bench
         run: |
           python3 tools/nx2/test_cache_metrics.py
           python3 tools/nx2/test_cache_bench.py
+          python3 tools/nx2/test_cache_records.py
 
       - name: Test ThreadWorker wake-ups
         run: |
           python3 tools/nx2/test_thread_worker_wake.py
           python3 -I tools/nx2/thread_worker_wake.py --cxx g++-13
+
+      - name: Test offline RADV shader checks
+        run: python3 tools/nx2/radv_offline/test_checks.py
 
       - name: Test Linux switch discovery
         run: CXX=g++-13 python3 tools/nx2/test_switches.py
@@ -261,6 +272,16 @@ jobs:
             echo "::error::lichii.exe imports nxformat.dll; nxformat must be linked statically"
             exit 1
           fi
+
+      # Antivirus heuristics count an unsigned program without file metadata against it.
+      - name: Check the shipped programs carry a version resource
+        run: |
+          for exe in lichii eden-cli lichii-updater; do
+            if ! grep -q 'Type: VERSIONINFO' <<< "$("$LLVM_ROOT/bin/llvm-readobj" --coff-resources "build/bin/$exe.exe")"; then
+              echo "::error::$exe.exe has no version resource"
+              exit 1
+            fi
+          done
 
       - name: Run tests
         run: ctest --test-dir build --output-on-failure --no-tests=error --parallel "$NUMBER_OF_PROCESSORS"

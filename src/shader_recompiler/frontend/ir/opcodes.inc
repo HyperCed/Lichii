@@ -23,6 +23,9 @@ OPCODE(EndPrimitive,                                        Void,           U32,
 OPCODE(Barrier,                                             Void,                                                                                           )
 OPCODE(WorkgroupMemoryBarrier,                              Void,                                                                                           )
 OPCODE(DeviceMemoryBarrier,                                 Void,                                                                                           )
+OPCODE(BarrierVoteInit,                                     Void,           U32,                                                                            )
+OPCODE(BarrierVote,                                         Void,           U1,             U32,            U32,                                            )
+OPCODE(VotedBarrier,                                        Void,           U32,            U32,                                                            )
 
 // Context getters/setters
 OPCODE(GetRegister,                                         U32,            Reg,                                                                            )

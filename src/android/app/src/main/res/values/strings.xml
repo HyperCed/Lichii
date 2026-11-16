@@ -550,6 +550,10 @@
     <string name="fsr_sharpness">FSR/SGSR sharpness</string>
     <string name="fsr_sharpness_description">Determines how sharpened the image will look while using FSR or SGSR filters</string>
     <string name="renderer_anti_aliasing">Anti-aliasing method</string>
+    <string name="oot_anti_aliasing">Ocarina of Time anti-aliasing</string>
+    <string name="oot_anti_aliasing_description">The Legend of Zelda: Ocarina of Time only. Game: the game\'s own anti-aliasing network, which sharpens heavily. No sharpening: the image as the game renders it, without the network (faster; pairs well with a higher resolution). Takes effect when the game starts.</string>
+    <string name="oot_anti_aliasing_game">Game</string>
+    <string name="oot_anti_aliasing_no_sharpening">No sharpening</string>
 
 
     <string name="advanced">Advanced</string>

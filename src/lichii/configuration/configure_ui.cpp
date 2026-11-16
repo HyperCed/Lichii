@@ -14,6 +14,9 @@
 #include <QCoreApplication>
 #include <QDirIterator>
 #include <QFileDialog>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QLineEdit>
 #include <QLocale>
 #include <QString>
 #include <QToolButton>
@@ -102,6 +105,32 @@ ConfigureUi::ConfigureUi(Core::System& system_, QWidget* parent)
       resolution_setting{Settings::values.resolution_setup.GetValue()}, system{system_} {
     ui->setupUi(this);
 
+    // Optional SteamGridDB artwork lookup for games without artwork; off while the key is empty.
+    {
+        auto* const key_layout = new QHBoxLayout;
+        auto* const key_label = new QLabel(tr("SteamGridDB API key:"), this);
+        steamgriddb_key_edit = new QLineEdit(this);
+        steamgriddb_key_edit->setEchoMode(QLineEdit::Password);
+        steamgriddb_key_edit->setPlaceholderText(tr("Empty: no online lookup"));
+        steamgriddb_key_edit->setClearButtonEnabled(true);
+        const QString tooltip =
+            tr("Artwork is looked up on steamgriddb.com only when a key is set, for games that "
+               "have no icon and no custom artwork. The picture is saved as the game's custom "
+               "artwork, so you can still replace it in Configure Game.");
+        key_label->setToolTip(tooltip);
+        steamgriddb_key_edit->setToolTip(tooltip);
+        auto* const key_link = new QLabel(
+            tr("<a href=\"%1\">Get a key</a>")
+                .arg(QStringLiteral("https://www.steamgriddb.com/profile/preferences/api")),
+            this);
+        key_link->setOpenExternalLinks(true);
+        key_link->setTextInteractionFlags(Qt::TextBrowserInteraction);
+        key_layout->addWidget(key_label);
+        key_layout->addWidget(steamgriddb_key_edit, 1);
+        key_layout->addWidget(key_link);
+        ui->GeneralVerticalLayout->addLayout(key_layout);
+    }
+
     InitializeLanguageComboBox();
 
     for (const auto& theme : UISettings::themes) {
@@ -167,6 +196,8 @@ void ConfigureUi::ApplyConfiguration() {
     UISettings::values.folder_icon_size = ui->folder_icon_size_combobox->currentData().toUInt();
     UISettings::values.row_1_text_id = ui->row_1_text_combobox->currentData().toUInt();
     UISettings::values.row_2_text_id = ui->row_2_text_combobox->currentData().toUInt();
+    UISettings::values.steamgriddb_api_key =
+        steamgriddb_key_edit->text().trimmed().toStdString();
 
     UISettings::values.enable_screenshot_save_as = ui->enable_screenshot_save_as->isChecked();
     Common::FS::SetEdenPath(Common::FS::EdenPath::ScreenshotsDir,
@@ -184,6 +215,8 @@ void ConfigureUi::RequestGameListUpdate() {
 }
 
 void ConfigureUi::SetConfiguration() {
+    steamgriddb_key_edit->setText(
+        QString::fromStdString(UISettings::values.steamgriddb_api_key.GetValue()));
     ui->theme_combobox->setCurrentIndex(
         ui->theme_combobox->findData(QString::fromStdString(UISettings::values.theme)));
     const QString language = QString::fromStdString(UISettings::values.language.GetValue());

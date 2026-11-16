@@ -17,6 +17,7 @@ add_library(video_core STATIC
     buffer_cache/buffer_cache_base.h
     buffer_cache/buffer_cache.cpp
     buffer_cache/buffer_cache.h
+    buffer_cache/compute_write_grid.h
     buffer_cache/indirect_buffer.h
     buffer_cache/memory_tracker_base.h
     buffer_cache/usage_tracker.h
@@ -66,6 +67,7 @@ add_library(video_core STATIC
     fsr.cpp
     fsr.h
     fsr4_support.h
+    ocarina_camera.h
     game_dlss_status.cpp
     game_dlss_status.h
     host1x/codecs/decoder.cpp
@@ -101,6 +103,7 @@ add_library(video_core STATIC
     macro_turing.h
     fence_manager.h
     frame_gen_choice.h
+    front_qmd.h
     gpu.cpp
     gpu.h
     gpu_timestamp.h
@@ -108,6 +111,17 @@ add_library(video_core STATIC
     gpu_split.h
     gpu_thread.cpp
     gpu_thread.h
+    gpu_trace/map_log.h
+    gpu_trace/recorder.cpp
+    gpu_trace/recorder.h
+    gpu_trace/replay.cpp
+    gpu_trace/replay.h
+    gpu_trace/sample.cpp
+    gpu_trace/sample.h
+    gpu_trace/state.cpp
+    gpu_trace/state.h
+    gpu_trace/trace_file.cpp
+    gpu_trace/trace_file.h
     guest_memory.h
     invalidation_accumulator.h
     memory_manager.cpp
@@ -120,8 +134,6 @@ add_library(video_core STATIC
     nx2.h
     nx2_back_idle_trace.cpp
     nx2_back_idle_trace.h
-    nx2_list_grid.cpp
-    nx2_list_grid.h
     nx2_list_macro_trace.cpp
     nx2_list_macro_trace.h
     nx2_cmdpage_diag.h
@@ -129,12 +141,17 @@ add_library(video_core STATIC
     nx2_debug_control.h
     nx2_fast_draw.cpp
     nx2_fast_draw.h
+    nx2_list_indirect.h
+    nx2_list_indirect_stats.h
+    nx2_owed_words.h
     nx2_profile.h
     nx2_stutter_trace.cpp
     nx2_stutter_trace.h
     nx2_perf.h
     nx2_async_readback.h
+    nx2_backx.h
     nx2_download_trace.h
+    nx2_drain_check.h
     pending_maps.h
     present.h
     pte_kind.h
@@ -187,6 +204,8 @@ add_library(video_core STATIC
     renderer_vulkan/framebuffer_limits.h
     renderer_vulkan/maxwell_to_vk.cpp
     renderer_vulkan/maxwell_to_vk.h
+    renderer_vulkan/nx2_list_slots.cpp
+    renderer_vulkan/nx2_list_slots.h
     renderer_vulkan/pipeline_build.h
     renderer_vulkan/pipeline_build_failure.cpp
     renderer_vulkan/pipeline_build_failure.h
@@ -212,6 +231,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_fsr3_upscaler.h
     renderer_vulkan/vk_fsr4_upscaler.cpp
     renderer_vulkan/vk_fsr4_upscaler.h
+    vulkan_common/descriptor_limits.h
     vulkan_common/ffx_files.h
     vulkan_common/ffx_runtime.cpp
     vulkan_common/ffx_runtime.h
@@ -377,6 +397,7 @@ add_library(video_core STATIC
     textures/workers.h
     transform_feedback.cpp
     transform_feedback.h
+    vertex_input_cache.h
     video_core.cpp
     video_core.h
 )
@@ -546,6 +567,37 @@ add_custom_command(
     DEPENDS ${lowering_inputs} "${PROJECT_SOURCE_DIR}/CMakeModules/GenerateShaderLoweringStamp.cmake"
     VERBATIM)
 target_sources(video_core PRIVATE "${lowering_stamp}")
+# Shader precache marker: a hash of every source that shapes the SPIR-V built from guest code
+# (the lowering stamp's sources, the rest of the recompiler without its OpenGL backends, the shader
+# environment that hands it the recorded values and the Vulkan wrapper that calls the SPIR-V
+# backend), so a build that may emit other SPIR-V runs the precache once more
+# (ShaderWarm::EmissionStamp).
+file(GLOB_RECURSE emission_sources CONFIGURE_DEPENDS RELATIVE "${lowering_source_dir}"
+     "${lowering_source_dir}/shader_recompiler/*.cpp" "${lowering_source_dir}/shader_recompiler/*.h"
+     "${lowering_source_dir}/shader_recompiler/*.inc")
+list(FILTER emission_sources EXCLUDE REGEX "^shader_recompiler/backend/(glasm|glsl)/")
+list(APPEND emission_sources ${lowering_sources}
+     video_core/renderer_vulkan/pipeline_shader_emission.h video_core/shader_environment.cpp
+     video_core/shader_environment.h)
+list(REMOVE_DUPLICATES emission_sources)
+list(SORT emission_sources)
+list(TRANSFORM emission_sources PREPEND "${lowering_source_dir}/" OUTPUT_VARIABLE emission_inputs)
+# Too many paths for a Windows command line: they go through a file, one per line.
+list(JOIN emission_sources "\n" emission_text)
+set(emission_dir "${CMAKE_CURRENT_BINARY_DIR}/generated/video_core/shader_warm")
+set(emission_list "${emission_dir}/emission_sources.txt")
+file(CONFIGURE OUTPUT "${emission_list}" CONTENT "${emission_text}\n" @ONLY)
+set(emission_stamp "${emission_dir}/emission_stamp.h")
+add_custom_command(
+    OUTPUT "${emission_stamp}"
+    COMMAND ${CMAKE_COMMAND} "-DSOURCE_DIR=${lowering_source_dir}" "-DFILES_FROM=${emission_list}"
+            "-DOUTPUT=${emission_stamp}" "-DNAMESPACE=VideoCommon::ShaderWarm"
+            "-DNAME=GeneratedEmissionStamp"
+            -P "${PROJECT_SOURCE_DIR}/CMakeModules/GenerateShaderLoweringStamp.cmake"
+    DEPENDS ${emission_inputs} "${emission_list}"
+            "${PROJECT_SOURCE_DIR}/CMakeModules/GenerateShaderLoweringStamp.cmake"
+    VERBATIM)
+target_sources(video_core PRIVATE "${emission_stamp}")
 target_include_directories(video_core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(video_core PUBLIC shader_recompiler stb bc_decoder gpu_logging)
 if (ENABLE_OPENGL)

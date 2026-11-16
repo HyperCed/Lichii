@@ -6,10 +6,12 @@
 // same shape must still parse.
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <iterator>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -26,7 +28,9 @@
 #include "core/file_sys/fssystem/fssystem_integrity_verification_storage.h"
 #include "core/file_sys/fssystem/fssystem_nca_file_system_driver.h"
 #include "core/file_sys/fssystem/fssystem_nca_header.h"
+#include "core/file_sys/ips_layer.h"
 #include "core/file_sys/partition_filesystem.h"
+#include "core/file_sys/program_metadata.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/vfs/vfs_vector.h"
 #include "core/loader/loader.h"
@@ -473,6 +477,55 @@ TEST_CASE("NCA rejects a hash region larger than the file behind an indirect lay
     REQUIRE(nca.Open() == ResultNcaBaseStorageOutOfRangeC);
 }
 
+// A decrypted NCA with its ExeFS at the start and its logo partition 2 MiB in, as in a program
+// NCA. Reaching the logo of a solid NCZ means decoding everything before it.
+TEST_CASE("NCA opens a section only when it is used", "[core][file_sys]") {
+    constexpr u32 LogoSector = 0x1006;
+    std::vector<u8> bytes(0xC00);
+    NcaHeader header{};
+    header.magic = NcaHeader::MagicDecrypted;
+    header.content_type = NcaHeader::ContentType::Program;
+    header.sdk_addon_version = 0x000C0000;
+    header.fs_info[0].start_sector = 6;
+    header.fs_info[0].end_sector = 0x26;
+    header.fs_info[1].start_sector = LogoSector;
+    header.fs_info[1].end_sector = LogoSector + 0x20;
+    std::memcpy(bytes.data(), &header, sizeof(header));
+    NcaFsHeader fs{};
+    fs.version = 2;
+    fs.fs_type = NcaFsHeader::FsType::PartitionFs;
+    fs.hash_type = NcaFsHeader::HashType::None;
+    fs.encryption_type = NcaFsHeader::EncryptionType::None;
+    std::memcpy(bytes.data() + sizeof(header), &fs, sizeof(fs));
+    std::memcpy(bytes.data() + sizeof(header) + sizeof(fs), &fs, sizeof(fs));
+
+    const auto exefs = MakePfs0WithFiles({{"main", std::vector<u8>(0x10)}, {"main.npdm", {}}});
+    const auto logo =
+        MakePfs0WithFiles({{"NintendoLogo.png", std::vector<u8>(0x10)}, {"StartupMovie.gif", {}}});
+    bytes.resize(size_t{LogoSector + 0x20} * 0x200);
+    std::copy(exefs.begin(), exefs.end(), bytes.begin() + 0xC00);
+    std::copy(logo.begin(), logo.end(), bytes.begin() + size_t{LogoSector} * 0x200);
+
+    class FarthestRead final : public VectorVfsFile {
+    public:
+        explicit FarthestRead(std::vector<u8> raw) : VectorVfsFile(std::move(raw), "test.nca") {}
+        std::size_t Read(u8* out, std::size_t size, std::size_t offset) const override {
+            farthest = std::max(farthest, offset + size);
+            return VectorVfsFile::Read(out, size, offset);
+        }
+        mutable std::size_t farthest{};
+    };
+    const auto file = std::make_shared<FarthestRead>(std::move(bytes));
+    const NCA nca{file};
+    REQUIRE(nca.GetStatus() == Loader::ResultStatus::Success);
+    REQUIRE(nca.GetExeFS() != nullptr);
+    CHECK(file->farthest <= size_t{LogoSector} * 0x200);
+
+    REQUIRE(nca.GetLogoPartition() != nullptr);
+    CHECK(file->farthest > size_t{LogoSector} * 0x200);
+    CHECK(nca.GetSubdirectories().size() == 2);
+}
+
 // A card image whose root HFS0 holds empty partitions with the given names.
 std::vector<u8> MakeXci(const std::vector<std::string>& partitions) {
     std::vector<u8> partition;
@@ -537,6 +590,72 @@ TEST_CASE("Integrity storage zeroes only the requested bytes past the data",
     REQUIRE(buffer[47] == 0xAA);
 
     REQUIRE(storage.Read(buffer.data(), 1, 0x1000) == 0);
+}
+
+VirtualFile MakeText(std::string_view text) {
+    return MakeFile(std::vector<u8>(text.begin(), text.end()));
+}
+
+// Applies an IPSwitch text patch to `size` zero bytes.
+std::vector<u8> ApplyIPSwitch(const IPSwitchCompiler& compiler, size_t size) {
+    return compiler.Apply(MakeFile(std::vector<u8>(size)))->ReadAllBytes();
+}
+
+TEST_CASE("IPSwitch applies a record after an offset shift", "[core][file_sys]") {
+    const IPSwitchCompiler compiler{MakeText("@flag offset_shift 0x10\n@enabled\n00000000 AB\n")};
+    const auto out = ApplyIPSwitch(compiler, 0x40);
+    REQUIRE(out[0] == 0);
+    REQUIRE(out[0x10] == 0xAB);
+}
+
+TEST_CASE("IPSwitch build ID line shorter than @nsobid- names no build ID", "[core][file_sys]") {
+    const IPSwitchCompiler compiler{MakeText("@nso\n@enabled\n00000000 AB\n")};
+    REQUIRE(compiler.GetBuildID() == std::array<u8, 0x20>{});
+    REQUIRE(ApplyIPSwitch(compiler, 0x10)[0] == 0xAB);
+}
+
+TEST_CASE("IPSwitch offset shift without a value does not read the next lines",
+          "[core][file_sys]") {
+    // Parsing the value from the raw line used to skip the line break and read "0x20".
+    const IPSwitchCompiler compiler{
+        MakeText("@flag offset_shift\n\n0x20\n@enabled\n00000000 AB\n")};
+    const auto out = ApplyIPSwitch(compiler, 0x40);
+    REQUIRE(out[0] == 0xAB);
+    REQUIRE(out[0x20] == 0);
+}
+
+
+// A 0x480-byte NPDM with its ACID at 0x100 and its ACI0 at `aci_offset`.
+VirtualFile MakeNpdm(u32 aci_offset) {
+    std::vector<u8> bytes(0x480);
+    std::memcpy(bytes.data(), "META", 4);
+    Put(bytes, 0x70, aci_offset);
+    Put(bytes, 0x74, u32{0x40});
+    Put(bytes, 0x78, u32{0x100});
+    Put(bytes, 0x7C, u32{0x240});
+    std::memcpy(bytes.data() + 0x300, "ACID", 4);
+    Put(bytes, 0x320, u32{0x240}); // file access control, ACID-relative
+    Put(bytes, 0x324, u32{0x2C});
+    std::memcpy(bytes.data() + 0x400, "ACI0", 4);
+    Put(bytes, 0x420, u32{0x40}); // file access header, ACI0-relative
+    Put(bytes, 0x424, u32{0x1C});
+    Put(bytes, 0x430, u32{0x60}); // kernel capabilities, ACI0-relative
+    Put(bytes, 0x434, u32{8});
+    return MakeFile(std::move(bytes));
+}
+
+TEST_CASE("NPDM with an ACI0 block loads", "[core][file_sys]") {
+    ProgramMetadata npdm;
+    REQUIRE(npdm.Load(MakeNpdm(0x400)) == Loader::ResultStatus::Success);
+}
+
+TEST_CASE("NPDM rejects an ACI0 offset that does not point at an ACI0 block",
+          "[core][file_sys]") {
+    // Offsets 0 and 1 used to load, with the ACI0 fields read from the NPDM header.
+    for (const u32 offset : {0u, 1u, 0x100u}) {
+        ProgramMetadata npdm;
+        CHECK(npdm.Load(MakeNpdm(offset)) == Loader::ResultStatus::ErrorBadACIHeader);
+    }
 }
 
 } // namespace

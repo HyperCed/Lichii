@@ -364,6 +364,43 @@ void TightenOutputVertices(IR::Program& program) {
 }
 } // Anonymous namespace
 
+void TrimGeometryPassthrough(IR::Program& program, const VaryingState& previous_stores) {
+    if (!program.is_geometry_passthrough) {
+        return;
+    }
+    std::bitset<32> dropped;
+    for (u32 j = 0; j < 32; ++j) {
+        if (program.info.passthrough.Generic(j) && !previous_stores.Generic(j)) {
+            dropped.set(j);
+        }
+    }
+    if (dropped.none()) {
+        return;
+    }
+    for (IR::Block* const block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() != IR::Opcode::SetAttribute) {
+                continue;
+            }
+            const IR::Attribute attr{inst.Arg(0).Attribute()};
+            if (!IR::IsGeneric(attr) || !dropped.test(IR::GenericAttributeIndex(attr))) {
+                continue;
+            }
+            inst.Invalidate();
+        }
+    }
+    for (u32 j = 0; j < 32; ++j) {
+        if (!dropped.test(j)) {
+            continue;
+        }
+        const size_t base = static_cast<size_t>(IR::Attribute::Generic0X) + j * 4;
+        for (size_t component = 0; component < 4; ++component) {
+            program.info.passthrough.mask[base + component] = false;
+            program.info.stores.mask[base + component] = false;
+        }
+    }
+}
+
 IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Block>& block_pool,
                              Environment& env, Flow::CFG& cfg, const HostTranslateInfo& host_info) {
     HostTranslateInfo normalized_host_info{host_info};
@@ -390,7 +427,15 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
         if (program.is_geometry_passthrough) {
             const auto& mask{env.GpPassthroughMask()};
             for (size_t i = 0; i < mask.size() * 32; ++i) {
-                program.info.passthrough.mask[i] = ((mask[i / 32] >> (i % 32)) & 1) == 0;
+                // Only position and the generics can pass through: the skip mask covers every
+                // attribute word, and a cleared register (Donkey Kong Bananza leaves it at 0) would
+                // otherwise declare vertex/instance ids, front face, point coords and tess coords
+                // as geometry inputs (invalid SPIR-V that crashes the AMD driver).
+                const auto attribute = static_cast<IR::Attribute>(i);
+                const bool allowed = (attribute >= IR::Attribute::PositionX &&
+                                      attribute <= IR::Attribute::PositionW) ||
+                                     IR::IsGeneric(attribute);
+                program.info.passthrough.mask[i] = allowed && ((mask[i / 32] >> (i % 32)) & 1) == 0;
             }
 
             if (!normalized_host_info.support_geometry_shader_passthrough) {
@@ -453,12 +498,13 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     if (!normalized_host_info.support_int64) {
         Optimization::LowerInt64ToInt32(program);
     }
-    if (!normalized_host_info.support_conditional_barrier) {
-        Optimization::ConditionalBarrierPass(program);
-    }
     Optimization::SsaRewritePass(program);
 
     Optimization::ConstantPropagationPass(env, program);
+    if (!normalized_host_info.support_conditional_barrier) {
+        Optimization::ConditionalBarrierPass(program,
+                                             normalized_host_info.max_compute_shared_memory_size);
+    }
 
     Optimization::PositionPass(env, program);
     Optimization::BlitConstantsPass(env, program);
@@ -476,6 +522,17 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
         Optimization::VerificationPass(program);
     }
     Optimization::CollectShaderInfoPass(env, program);
+    // Adreno's proprietary driver culls 8x8 low-resolution-Z tiles with stale data in Ocarina
+    // (checkerboard holes in depth, sky showing through near geometry and water). Writing
+    // FragDepth = FragCoord.z from every fragment shader makes the driver turn LRZ off.
+    if (host_info.needs_lrz_disable && program.stage == Stage::Fragment &&
+        !program.info.stores_frag_depth && !program.blocks.empty()) {
+        IR::Block& entry{*program.blocks.front()};
+        IR::IREmitter ir{entry, entry.begin()};
+        ir.SetFragDepth(ir.GetAttribute(IR::Attribute::PositionZ));
+        program.info.stores_frag_depth = true;
+        program.info.loads.Set(IR::Attribute::PositionZ, true);
+    }
     program.info.is_task = program.stage == Stage::Task;
     program.info.is_mesh = program.stage == Stage::Mesh;
     if (program.stage == Stage::Mesh) {

@@ -5,12 +5,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bitset>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <string_view>
 #include <thread>
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
@@ -23,6 +26,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/literals.h"
+#include "common/logging.h"
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -37,6 +41,10 @@
 #include "video_core/vulkan_common/streamline.h"
 #endif
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #if defined(__ANDROID__) && defined(ARCHITECTURE_arm64)
 #include <adrenotools/bcenabler.h>
 #include <android/api-level.h>
@@ -45,6 +53,23 @@
 namespace Vulkan {
 using namespace Common::Literals;
 namespace {
+// Matches Mesa's boolean parsing of its environment options.
+bool EnvFlagSet(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) {
+        return false;
+    }
+    const std::string_view v{value};
+    for (const std::string_view truthy : {"1", "true", "t", "yes", "y"}) {
+        if (std::ranges::equal(v, truthy, [](char a, char b) {
+                return std::tolower(static_cast<unsigned char>(a)) == b;
+            })) {
+            return true;
+        }
+    }
+    return false;
+}
+
 namespace Alternatives {
 constexpr std::array STENCIL8_UINT{
     VK_FORMAT_D16_UNORM_S8_UINT,
@@ -113,6 +138,9 @@ constexpr std::array B10G11R11_UFLOAT_PACK32{
 };
 
 } // namespace Alternatives
+
+// VK_ENABLE_BETA_EXTENSIONS is not defined, so vulkan_core.h leaves this value out.
+constexpr auto PORTABILITY_SUBSET_FEATURES_STYPE = static_cast<VkStructureType>(1000163000);
 
 template <typename T>
 void SetNext(void**& next, T& data) {
@@ -593,7 +621,8 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         IsFormatSupported(VK_FORMAT_D24_UNORM_S8_UINT,
                           VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT, FormatType::Optimal);
 
-    supports_conditional_barriers = !is_intel_windows;
+    supports_conditional_barriers =
+        !is_intel_windows && driver_id != VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
 
     CollectPhysicalMemoryInfo();
     CollectToolingInfo();
@@ -1169,11 +1198,26 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
 }
 
 void Device::ReportLoss() const {
+    static std::atomic_flag reported;
+    if (reported.test_and_set()) {
+        // The first thread to see the loss reports it and ends the process.
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::hours{1});
+        }
+    }
     LOG_CRITICAL(Render_Vulkan, "Device loss occurred!");
     ReportDeviceFault();
-
-    // Wait for the log to flush and for Nsight Aftermath to dump the results
-    std::this_thread::sleep_for(std::chrono::seconds{15});
+    if (nsight_aftermath_tracker) {
+        // Give Nsight Aftermath time to write its dump.
+        std::this_thread::sleep_for(std::chrono::seconds{15});
+    }
+    LOG_CRITICAL(Render_Vulkan, "Closing Lichii: the GPU driver lost the Vulkan device");
+    Common::Log::Flush();
+#ifdef _WIN32
+    // Skips DLL detach, which runs the GPU driver's teardown on the lost device.
+    TerminateProcess(GetCurrentProcess(), EXIT_FAILURE);
+#endif
+    std::_Exit(EXIT_FAILURE);
 }
 
 void Device::ReportDeviceFault() const {
@@ -1247,6 +1291,19 @@ void Device::ReportDeviceFault() const {
 void Device::SaveShader(std::span<const u32> spirv) const {
     if (nsight_aftermath_tracker) {
         nsight_aftermath_tracker->SaveShader(spirv);
+    }
+}
+
+bool Device::DriverCachesPipelines() const noexcept {
+    switch (properties.driver.driverID) {
+    case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
+    case VK_DRIVER_ID_AMD_PROPRIETARY:
+        return true;
+    case VK_DRIVER_ID_MESA_RADV:
+        // RADV uses Mesa's on-disk shader cache unless the user turns it off.
+        return !EnvFlagSet("MESA_SHADER_CACHE_DISABLE") && !EnvFlagSet("MESA_GLSL_CACHE_DISABLE");
+    default:
+        return false;
     }
 }
 
@@ -1389,6 +1446,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
     FOR_EACH_VK_FEATURE_EXT(FEATURE_EXTENSION);
     FOR_EACH_VK_EXTENSION(EXTENSION);
 
+    // The spec requires enabling VK_KHR_portability_subset on devices that expose it.
+    if (supported_extensions.contains(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
+        loaded_extensions.insert(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+    }
+
     extensions.depth_stencil_resolve =
         extensions.depth_stencil_resolve &&
         (instance_version >= VK_API_VERSION_1_2 || extensions.create_renderpass2);
@@ -1522,6 +1584,12 @@ bool Device::GetSuitability(bool requires_swapchain) {
         SetNext(next, device_fault_features);
     }
 
+    // The features the driver reports are enabled through the same chain at device creation.
+    if (loaded_extensions.contains(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
+        portability_subset_features.sType = PORTABILITY_SUBSET_FEATURES_STYPE;
+        SetNext(next, portability_subset_features);
+    }
+
     // Perform the feature test.
     physical.GetFeatures2(features2);
 
@@ -1587,6 +1655,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
         properties.push_descriptor.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR;
         SetNext(next, properties.push_descriptor);
+    }
+    if (extensions.descriptor_indexing || instance_version >= VK_API_VERSION_1_2) {
+        properties.descriptor_indexing.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES;
+        SetNext(next, properties.descriptor_indexing);
     }
     if (extensions.depth_stencil_resolve || instance_version >= VK_API_VERSION_1_2) {
         properties.depth_stencil_resolve.sType =
@@ -1716,6 +1789,18 @@ bool Device::GetSuitability(bool requires_swapchain) {
 }
 
 void Device::RemoveUnsuitableExtensions() {
+    // VK_EXT_image_compression_control: only to create colour images without DCC on RADV before
+    // GFX10 (wave64 only). There DCC is never compressed in the GENERAL layout Lichii keeps its
+    // images in, and each copy's TRANSFER_SRC/DST -> GENERAL transition decompresses the whole
+    // image. RADV_DEBUG=nodcc: 9.5 -> 21 fps in Ocarina of Time's Kokiri Forest on an RX 580.
+    extensions.image_compression_control =
+        features.image_compression_control.imageCompressionControl &&
+        properties.driver.driverID == VK_DRIVER_ID_MESA_RADV &&
+        properties.subgroup_size_control.minSubgroupSize == 64;
+    RemoveExtensionFeatureIfUnsuitable(extensions.image_compression_control,
+                                       features.image_compression_control,
+                                       VK_EXT_IMAGE_COMPRESSION_CONTROL_EXTENSION_NAME);
+
     // VK_EXT_color_write_enable
     extensions.color_write_enable = features.color_write_enable.colorWriteEnable;
     RemoveExtensionFeatureIfUnsuitable(extensions.color_write_enable, features.color_write_enable,
@@ -1907,6 +1992,34 @@ void Device::RemoveUnsuitableExtensions() {
         LOG_WARNING(Render_Vulkan, "EDEN_NX2_FORCE_MESH_FALLBACK: VK_EXT_mesh_shader disabled");
         extensions.mesh_shader = false;
     }
+    // Native task/mesh draws hang RDNA2 GPUs, while the compute fallback runs there. RADV faults
+    // the TCP at one fixed address per machine, then times out a ring, often with a MODE1 reset
+    // (#489, #1275, #1699). AMD's own driver loses the device (#871; in #1934 an RX 6800 XT lost
+    // it after 6 minutes and ran 32 on the fallback). RADV exposes mesh shaders from GFX10.3 on
+    // and reports accelerated 16-bit dot products only before GFX11. AMD's driver exposes them
+    // from RDNA2 on and reports accelerated mixed-signedness dot4 from RDNA3 on. The Mesh Shaders
+    // setting picks Native or Compute instead (from community PR #814).
+    const VkDriverId mesh_driver = properties.driver.driverID;
+    const auto& dot_product = properties.integer_dot_product;
+    const bool rdna2_mesh =
+        (mesh_driver == VK_DRIVER_ID_MESA_RADV &&
+         dot_product.integerDotProduct16BitUnsignedAccelerated) ||
+        ((mesh_driver == VK_DRIVER_ID_AMD_PROPRIETARY ||
+          mesh_driver == VK_DRIVER_ID_AMD_OPEN_SOURCE) &&
+         !dot_product.integerDotProduct4x8BitPackedMixedSignednessAccelerated);
+    const Settings::MeshShaderMode mesh_mode = Settings::values.mesh_shaders.GetValue();
+    if (extensions.mesh_shader && mesh_mode == Settings::MeshShaderMode::Compute) {
+        LOG_INFO(Render_Vulkan, "Mesh Shaders setting: task/mesh draws use the compute fallback");
+        extensions.mesh_shader = false;
+    } else if (extensions.mesh_shader && rdna2_mesh) {
+        if (mesh_mode == Settings::MeshShaderMode::Native) {
+            LOG_INFO(Render_Vulkan, "Mesh Shaders setting: native task/mesh draws on AMD RDNA2");
+        } else {
+            LOG_INFO(Render_Vulkan, "AMD RDNA2: task/mesh draws use the compute fallback, because "
+                                    "native mesh draws hang the GPU there");
+            extensions.mesh_shader = false;
+        }
+    }
     RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,
                                        VK_EXT_MESH_SHADER_EXTENSION_NAME);
 
@@ -1960,7 +2073,21 @@ void Device::RemoveUnsuitableExtensions() {
                      "VK_KHR_cooperative_matrix is emulated on this AMD GPU: guest tensor "
                      "operations stay in shader emulation");
         }
+        // NVIDIA's compiler miscompiles some cooperative matrix shaders on Turing only, a bug
+        // NVIDIA confirmed without a workaround (llama.cpp#19290 keeps its coopmat1 flash
+        // attention off Turing for it). Ocarina of Time's anti-aliasing network then shows green
+        // and red speckles (#1102). The self-test passes there, so it cannot catch this.
+        const bool turing_matrices = extensions.cooperative_matrix &&
+                                     driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
+                                     GetNvidiaArchitecture(physical, supported_extensions) ==
+                                         NvidiaArchitecture::Arch_Turing;
+        if (turing_matrices) {
+            LOG_INFO(Render_Vulkan,
+                     "VK_KHR_cooperative_matrix is miscompiled on Turing: guest tensor operations "
+                     "stay in shader emulation");
+        }
         const bool usable = extensions.cooperative_matrix && !emulated_amd_matrices &&
+                            !turing_matrices &&
                             features.cooperative_matrix.cooperativeMatrix &&
                             (properties.cooperative_matrix.cooperativeMatrixSupportedStages &
                              VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
@@ -2032,6 +2159,11 @@ void Device::RemoveUnsuitableExtensions() {
     // disk cache of their own (DriverCachesPipelines) that don't prefer their internal cache: the
     // store would only duplicate it there (PipelineBinaries). NVIDIA 610.88 also gave ~7.8 MB of
     // blobs a pipeline: one Ocarina of Time session stored 2.3 GB.
+    // AMD's proprietary driver is the exception: its disk cache never keeps graphics pipelines
+    // with VK_DYNAMIC_STATE_VERTEX_INPUT_EXT (#770), so an RX 6650 XT rebuilt ~5,800 boot
+    // pipelines at ~120 ms each (12-15 min to the first frame) at every boot, and turning dynamic
+    // vertex input off lost the device on the first pipeline. The store keeps them instead.
+    const bool amd_binaries = properties.driver.driverID == VK_DRIVER_ID_AMD_PROPRIETARY;
     if (extensions.pipeline_binary) {
         LOG_INFO(Render_Vulkan,
                  "VK_KHR_pipeline_binary: pipelineBinaries {}, internal cache {}, prefers internal "
@@ -2043,7 +2175,8 @@ void Device::RemoveUnsuitableExtensions() {
     }
     extensions.pipeline_binary =
         features.pipeline_binary.pipelineBinaries && extensions.maintenance5 &&
-        !properties.pipeline_binary.pipelineBinaryPrefersInternalCache && !DriverCachesPipelines();
+        !properties.pipeline_binary.pipelineBinaryPrefersInternalCache &&
+        (!DriverCachesPipelines() || amd_binaries);
     RemoveExtensionFeatureIfUnsuitable(extensions.pipeline_binary, features.pipeline_binary,
                                        VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
 
@@ -2182,6 +2315,18 @@ u64 Device::GetDeviceMemorySlack() const {
 }
 
 u64 Device::GetDeviceMemoryBudget() const {
+    u64 result = GetDeviceHeapMemoryBudget();
+    if (is_integrated && !IsMoltenVK()) {
+        // An integrated GPU's device-local heap is system memory (a Radeon 780M reported a 21 GB
+        // budget): following it let the texture cache fill that much RAM before collecting, and
+        // kept ASTC uncompressed. Its budget is at most the share CollectPhysicalMemoryInfo
+        // gives it (4 GiB, 6 GiB with aggressive VRAM use).
+        result = (std::min)(result, device_access_memory);
+    }
+    return result;
+}
+
+u64 Device::GetDeviceHeapMemoryBudget() const {
     if (!extensions.memory_budget) {
         return 0;
     }
@@ -2204,13 +2349,6 @@ u64 Device::GetDeviceMemoryBudget() const {
         if (heap != main_heap) {
             result += AllocatedUsage(budget.heapUsage[heap], heap_budgets[heap]);
         }
-    }
-    if (is_integrated && !IsMoltenVK()) {
-        // An integrated GPU's device-local heap is system memory (a Radeon 780M reported a 21 GB
-        // budget): following it let the texture cache fill that much RAM before collecting, and
-        // kept ASTC uncompressed. Its budget is at most the share CollectPhysicalMemoryInfo
-        // gives it (4 GiB, 6 GiB with aggressive VRAM use).
-        result = (std::min)(result, device_access_memory);
     }
     return result;
 }
@@ -2264,6 +2402,7 @@ void Device::CollectPhysicalMemoryInfo() {
         }
         device_access_memory += heap_size;
     }
+    main_heap_size = limit(mem_properties.memoryHeaps[main_heap].size);
     if (is_integrated) {
         const s64 available_memory = static_cast<s64>(device_access_memory - device_initial_usage);
         const u64 memory_size = Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive ? 6_GiB : 4_GiB;

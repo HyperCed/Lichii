@@ -2,14 +2,18 @@
 
 #pragma once
 
+#include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "common/scope_exit.h"
 #include "common/unique_function.h"
 #include "video_core/renderer_vulkan/pipeline_build.h"
 #include "video_core/shader_jobs.h"
@@ -17,8 +21,8 @@
 namespace Vulkan {
 
 /// Shader cache v2: cached pipelines built in the background as Background jobs of one batch. A
-/// lookup of one still queued or building raises it to NeedNow and waits for it, so that it is
-/// built once.
+/// lookup of one still queued drops it, so the caller builds it as it builds any pipeline it lacks
+/// (without holding its thread where the draw allows); one a worker is building is waited for.
 template <typename Key, typename Pipeline>
 class ScheduledPrebuild {
     struct Entry {
@@ -31,8 +35,16 @@ public:
     /// Build() runs on a driver worker, and it is dropped when it Failed().
     using Translate = Common::UniqueFunction<std::unique_ptr<Pipeline>>;
 
-    ScheduledPrebuild(VideoCommon::ShaderJobScheduler& jobs_, u64 capture_limit_)
-        : jobs{jobs_}, batch{jobs_.CreateBatch()}, capture_limit{capture_limit_} {}
+    /// What became of the builds once every one has ended
+    struct Outcome {
+        size_t built;
+        size_t failed;
+        size_t taken_unfinished; ///< Taken by a lookup while still queued or building
+        size_t unclaimed;        ///< Built, and no lookup has taken them yet
+    };
+
+    explicit ScheduledPrebuild(VideoCommon::ShaderJobScheduler& jobs_)
+        : jobs{jobs_}, batch{jobs_.CreateBatch()} {}
 
     ~ScheduledPrebuild() {
         Stop();
@@ -41,54 +53,63 @@ public:
     ScheduledPrebuild(const ScheduledPrebuild&) = delete;
     ScheduledPrebuild& operator=(const ScheduledPrebuild&) = delete;
 
-    /// Submits the build of a pipeline whose translation holds `capture_bytes` until it runs,
-    /// unless one of its key is queued or the captures queued would pass the limit
-    bool Add(const Key& key, u64 capture_bytes, u64 cpu_bytes, u64 driver_bytes,
-             Translate translate) {
+    /// Submits the build of a pipeline, unless one of its key is queued. `job` gets its job.
+    bool Add(const Key& key, u64 cpu_bytes, u64 driver_bytes, Translate translate,
+             VideoCommon::ShaderJobHandle* job = nullptr) {
         std::scoped_lock lock{mutex};
-        if (stopped || entries.contains(key) || capture_bytes > capture_limit - captured_bytes) {
+        if (stopped || entries.contains(key)) {
             return false;
         }
-        captured_bytes += capture_bytes;
+        ++translating;
         auto entry = std::make_shared<Entry>();
         entry->job = jobs.Submit(
             {
                 .priority = VideoCommon::ShaderJobPriority::Background,
                 .cpu_bytes = cpu_bytes,
                 .driver_bytes = driver_bytes,
-                .cpu = [this, entry, capture_bytes, translate = std::move(translate)](
+                .cpu = [this, entry, translate = std::move(translate)](
                            VideoCommon::ShaderJobContext& context) mutable
                 -> VideoCommon::ShaderDriverStage {
-                    if (context.StopRequested()) {
-                        return {};
-                    }
-                    std::unique_ptr<Pipeline> pipeline = translate();
-                    translate = {};
+                    std::unique_ptr<Pipeline> pipeline;
                     {
-                        std::scoped_lock capture_lock{mutex};
-                        captured_bytes -= capture_bytes;
+                        SCOPE_EXIT {
+                            translate = {};
+                            Translated();
+                        };
+                        if (context.StopRequested()) {
+                            return {};
+                        }
+                        pipeline = translate();
                     }
                     if (!pipeline) {
+                        std::scoped_lock failed_lock{mutex};
+                        ++failed;
                         return {};
                     }
                     return [this, entry, pipeline = std::move(pipeline)]() mutable {
                         pipeline->Build();
+                        std::scoped_lock entry_lock{mutex};
                         if (pipeline->Failed()) {
+                            ++failed;
                             return;
                         }
-                        std::scoped_lock entry_lock{mutex};
+                        ++built;
                         entry->pipeline = std::move(pipeline);
                     };
                 },
             },
             &batch);
+        if (job) {
+            *job = entry->job;
+        }
         entries.emplace(key, std::move(entry));
         return true;
     }
 
-    /// The pipeline of `key`, built here or waited for while it builds; null when there is none
-    /// or it didn't build
-    std::unique_ptr<Pipeline> Take(const Key& key) {
+    /// The pipeline of `key`, waited for while a worker builds it (`waited` gets how long); null
+    /// when there is none, it didn't build, or it was still queued (then dropped)
+    std::unique_ptr<Pipeline> Take(
+        const Key& key, std::optional<std::chrono::steady_clock::duration>* waited = nullptr) {
         std::shared_ptr<Entry> entry;
         {
             std::scoped_lock lock{mutex};
@@ -99,9 +120,55 @@ public:
             entry = std::move(it->second);
             entries.erase(it);
         }
+        const bool unfinished = !entry->job.Ready();
+        if (unfinished) {
+            if (const auto cancelled = jobs.CancelQueued(entry->job)) {
+                if (*cancelled == VideoCommon::ShaderJobStatus::Queued) {
+                    Translated();
+                }
+                std::scoped_lock lock{mutex};
+                ++taken_unfinished;
+                return nullptr;
+            }
+        }
+        const auto begin = std::chrono::steady_clock::now();
         jobs.RunOrWait(entry->job);
         std::scoped_lock lock{mutex};
+        if (unfinished) {
+            ++taken_unfinished;
+            if (waited) {
+                *waited = std::chrono::steady_clock::now() - begin;
+            }
+        }
         return std::move(entry->pipeline);
+    }
+
+    /// Calls `done` once every build added so far was translated, on the thread that translated
+    /// the last one, or now when none is left. Never once Stop() returned.
+    void AfterTranslations(Common::UniqueFunction<void> done) {
+        {
+            std::scoped_lock lock{mutex};
+            if (translating != 0) {
+                after_translations = std::move(done);
+                return;
+            }
+        }
+        done();
+    }
+
+    /// The outcome once every build has ended, else nothing
+    std::optional<Outcome> Finished() const {
+        if (!batch.Idle()) {
+            return std::nullopt;
+        }
+        std::scoped_lock lock{mutex};
+        return Outcome{
+            .built = built,
+            .failed = failed,
+            .taken_unfinished = taken_unfinished,
+            .unclaimed = static_cast<size_t>(std::ranges::count_if(
+                entries, [](const auto& entry) { return entry.second->pipeline != nullptr; })),
+        };
     }
 
     /// The batch of the builds, to cancel them without waiting
@@ -111,6 +178,10 @@ public:
 
     /// Cancels the builds and drops every pipeline once the running ones end
     void Stop() {
+        {
+            std::scoped_lock lock{mutex};
+            after_translations = {};
+        }
         jobs.Cancel(batch);
         batch.Wait();
         std::unordered_map<Key, std::shared_ptr<Entry>> dropped;
@@ -121,13 +192,39 @@ public:
     }
 
 private:
+    void Translated() {
+        Common::UniqueFunction<void> done;
+        {
+            std::scoped_lock lock{mutex};
+            if (--translating != 0 || !after_translations) {
+                return;
+            }
+            done = std::move(after_translations);
+            after_translations = {};
+        }
+        done();
+    }
+
     VideoCommon::ShaderJobScheduler& jobs;
     VideoCommon::ShaderJobBatch batch;
-    const u64 capture_limit;
-    u64 captured_bytes{};
+    size_t translating{}; ///< Builds added and not translated yet
+    Common::UniqueFunction<void> after_translations;
+    size_t built{};
+    size_t failed{};
+    size_t taken_unfinished{};
     bool stopped{};
-    std::mutex mutex;
+    mutable std::mutex mutex;
     std::unordered_map<Key, std::shared_ptr<Entry>> entries;
 };
+
+/// The skipped cached records the prebuild takes, from `skipped` in the order of the log: the
+/// newest first (the log appends, so its end is what recent sessions recorded), at most `limit`.
+template <typename Record>
+std::vector<Record> NewestFirst(std::vector<Record> skipped, size_t limit) {
+    std::ranges::reverse(skipped);
+    skipped.erase(skipped.begin() + static_cast<std::ptrdiff_t>(std::min(limit, skipped.size())),
+                  skipped.end());
+    return skipped;
+}
 
 } // namespace Vulkan

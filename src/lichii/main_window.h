@@ -52,6 +52,7 @@ class GImageInfo;
 class GRenderWindow;
 class LoadingScreen;
 class OverlayDialog;
+class BugReportDialog;
 class ControllerDialog;
 class QLabel;
 class MultiplayerState;
@@ -294,7 +295,7 @@ private:
                   StartGameType with_config = StartGameType::Normal);
     void BootGameFromList(const QString& filename, StartGameType with_config);
     void ShutdownGame();
-    void TerminateEmulationThread();
+    void ExitIfEmulationThreadStuck();
 
     void SetDiscordEnabled(bool state);
     void LoadAmiibo(const QString& filename);
@@ -452,6 +453,7 @@ private slots:
     void OnCreateHomeMenuDesktopShortcut();
     void OnCreateHomeMenuApplicationMenuShortcut();
     void OnCaptureScreenshot();
+    void OnReportBug();
     /// Checks for decryption keys; `prompt` asks to install them when they are missing.
     void OnCheckFirmwareDecryption(bool prompt = true);
 #ifdef __unix__
@@ -469,6 +471,8 @@ private slots:
     bool EmulationShutdownProgressing();
 
 #ifdef ENABLE_UPDATE_CHECKER
+    // A manual check reports every outcome and ignores the skipped release and remind-later time.
+    void CheckForUpdates(bool manual);
     void OnEmulatorUpdateAvailable();
 #endif
     void KeepNextendoSessionAlive();
@@ -533,9 +537,21 @@ private:
 #ifdef ENABLE_UPDATE_CHECKER
     QFuture<UpdateChecker::CheckResult> update_future;
     QFutureWatcher<UpdateChecker::CheckResult> update_watcher;
+    bool update_check_running{};
+    bool update_check_manual{};
 #endif
 
     MultiplayerState* multiplayer_state = nullptr;
+    void RememberSpeedLimitBeforeHotkey();
+    void UndoSessionSpeedChanges();
+    /// The speed limit before the session's first Toggle Framerate Limit / turbo / slow hotkey,
+    /// and whether it was the global or the per-game value. Undone when the game stops, so the
+    /// hotkeys only last for the session; a change made in the configuration dialogs is kept.
+    struct SessionSpeedLimit {
+        bool value;
+        bool using_global;
+    };
+    std::optional<SessionSpeedLimit> speed_limit_before_hotkeys;
 
     GRenderWindow* render_window = nullptr;
     GameList* game_list = nullptr;
@@ -547,6 +563,7 @@ private:
     QTimer nextendo_session_timer;
     QFutureWatcher<bool> nextendo_session_watcher;
     OverlayDialog* shutdown_dialog{};
+    BugReportDialog* bug_report_dialog{};
     PerformanceOverlay* perf_overlay = nullptr;
 #ifdef HAS_RESHADE
     ConfigurePostProcessing* post_processing_dialog = nullptr;

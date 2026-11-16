@@ -830,6 +830,7 @@ void RasterizerOpenGL::SyncViewport() {
         }
         glFrontFace(mode);
     }
+    bool depth_mode_changed = false;
     if (dirty_viewport || dirty_clip_control) {
         flags[Dirty::ClipControl] = false;
 
@@ -841,7 +842,26 @@ void RasterizerOpenGL::SyncViewport() {
         if (lower_left) {
             flip_y = !flip_y;
         }
-        const bool is_zero_to_one = regs.depth_mode == Maxwell::DepthMode::ZeroToOne;
+        // A game can leave depth_mode at MinusOneToOne and map z in [0, 1] through the viewport
+        // (translate_z at the near or far value), which needs a depth range below 0. Without
+        // GL_NV_depth_buffer_float that range is clamped to [0, 1] and squeezes all depth into
+        // [0.5, 1], so use ZeroToOne with the same mapping. Ported from Ryujinx 30b7aaef (#2754).
+        // Only when viewport 0's range really goes below 0, so an untouched viewport 0
+        // (scale_z = 0) never changes the clip volume of the others.
+        const auto& transform = regs.viewport_transform[0];
+        const auto& viewport = regs.viewports[0];
+        const bool range_below_zero =
+            std::min(transform.translate_z - transform.scale_z,
+                     transform.translate_z + transform.scale_z) < 0.0f;
+        const bool zero_to_one_mapping =
+            range_below_zero && viewport.depth_range_near != viewport.depth_range_far &&
+            (transform.translate_z == viewport.depth_range_near ||
+             transform.translate_z == viewport.depth_range_far);
+        const bool is_zero_to_one =
+            regs.depth_mode == Maxwell::DepthMode::ZeroToOne ||
+            (!device.HasDepthBufferFloat() && zero_to_one_mapping);
+        depth_mode_changed = is_zero_to_one != depth_zero_to_one;
+        depth_zero_to_one = is_zero_to_one;
         const GLenum origin = flip_y ? GL_UPPER_LEFT : GL_LOWER_LEFT;
         const GLenum depth = is_zero_to_one ? GL_ZERO_TO_ONE : GL_NEGATIVE_ONE_TO_ONE;
         state_tracker.ClipControl(origin, depth);
@@ -862,7 +882,7 @@ void RasterizerOpenGL::SyncViewport() {
     if (dirty_viewport) {
         flags[Dirty::Viewports] = false;
 
-        const bool force = flags[Dirty::ViewportTransform] || rescale_viewports;
+        const bool force = flags[Dirty::ViewportTransform] || rescale_viewports || depth_mode_changed;
         flags[Dirty::ViewportTransform] = false;
         flags[VideoCommon::Dirty::RescaleViewports] = false;
 
@@ -895,7 +915,7 @@ void RasterizerOpenGL::SyncViewport() {
             glViewportIndexedf(static_cast<GLuint>(index), x, y, width != 0.0f ? width : 1.0f,
                                height != 0.0f ? height : 1.0f);
 
-            const GLdouble reduce_z = regs.depth_mode == Maxwell::DepthMode::MinusOneToOne;
+            const GLdouble reduce_z = depth_zero_to_one ? 0.0 : 1.0;
             const GLdouble near_depth = src.translate_z - src.scale_z * reduce_z;
             const GLdouble far_depth = src.translate_z + src.scale_z;
             if (device.HasDepthBufferFloat()) {

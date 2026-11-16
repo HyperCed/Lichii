@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -130,7 +131,8 @@ struct ShaderJobConfig {
     size_t driver_threads{1};
     /// Zero means DefaultShaderJobBudget().
     u64 memory_budget{};
-    /// A Background job queued this long competes with Soon jobs in submission order.
+    /// A Background job queued this long takes every other pick from the Soon jobs submitted
+    /// after it.
     std::chrono::nanoseconds background_aging{std::chrono::seconds{2}};
     /// Worker threads are named <name>Cpu and <name>Driver.
     std::string name{"ShaderJobs"};
@@ -162,6 +164,10 @@ public:
     /// A queued job is cancelled at once. A running CPU stage sees StopRequested() and no driver
     /// stage follows it; a running driver stage completes.
     void Cancel(const ShaderJobHandle& handle);
+
+    /// Cancels the job only while it is queued, before or after its CPU stage, and returns the
+    /// status it was queued in; nothing when a stage of it is running or it has ended.
+    std::optional<ShaderJobStatus> CancelQueued(const ShaderJobHandle& handle);
 
     /// Cancel for every job of the batch, now and later submitted.
     void Cancel(const ShaderJobBatch& batch);
@@ -203,6 +209,9 @@ private:
     bool stopping{};
     /// A worker waits for in-flight bytes to drop.
     bool budget_held{};
+    /// The queue's last Soon or Background pick was an aged Background job ahead of Soon jobs.
+    bool cpu_aged_last{};
+    bool driver_aged_last{};
     ShaderJobStats stats;
     std::vector<std::thread> threads;
 };

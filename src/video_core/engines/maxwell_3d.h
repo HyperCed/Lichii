@@ -26,13 +26,16 @@
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
 #include "video_core/nx2_fast_draw.h"
-#include "video_core/nx2_list_grid.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/textures/texture.h"
 #include "video_core/engines/maxwell_3d.h"
 
 namespace Core {
 class System;
+}
+
+namespace VideoCommon::GpuTrace {
+struct StateAccess;
 }
 
 namespace Tegra {
@@ -62,6 +65,8 @@ namespace Tegra::Engines {
 #define MAXWELL3D_REG_INDEX(field_name) (offsetof(Maxwell3D::Regs, field_name) / sizeof(u32))
 
 class Maxwell3D final : public EngineInterface {
+    friend struct ::VideoCommon::GpuTrace::StateAccess;
+
 public:
     explicit Maxwell3D(MemoryManager& memory_manager);
     ~Maxwell3D();
@@ -3209,6 +3214,16 @@ public:
     void CallConstBufferWords(Core::System& system, const u32* methods, const u32* arguments,
                               u32 count);
 
+    /// No write of a state block ends fast draw reuse (WriteStateRegisters).
+    static constexpr u32 NoBreak = ~0U;
+    /// GpuSplit's back: state register writes the front sent as one entry (GpuSplit::StateWrite),
+    /// each `method | value << 32`, in order. `flags`: the dirty flags they set, a bit each;
+    /// `last_break`: the last of them whose change ends fast draw reuse. As a CallMethod of each
+    /// when every write changes its register: the stores, then the flags and one break.
+    /// EDEN_NX2_REG_BLOCK_VERIFY=1 also runs them one by one and compares.
+    void WriteStateRegisters(Core::System& system, std::span<const u64, 4> flags,
+                             std::span<const u64> writes, u32 last_break);
+
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod: runs macros and macro uploads against a copy of the
     /// registers and sends the register writes to the back thread.
@@ -3216,9 +3231,6 @@ public:
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
-    /// List-fed grid macros (nx2_list_grid.h): the markers of the data RAM, which the compute
-    /// engine shares and stores them in (KeplerCompute::FrontTakeListGrid).
-    Nx2ListGrid::GridMarker grid_marker;
 
     bool ShouldExecute() const {
         return execute_on;
@@ -3355,6 +3367,11 @@ private:
     void CallMethodFast(u32 method, u32 method_argument, bool is_last_call);
     /// EDEN_NX2_PERF_VERIFY: CallMethodFast's register state against CallMethodSlow's.
     void VerifyCallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call);
+    /// WriteStateRegisters' stores and flags.
+    void StoreStateRegisters(std::span<const u64, 4> flags, std::span<const u64> writes);
+    /// EDEN_NX2_REG_BLOCK_VERIFY: StoreStateRegisters against a CallMethod of each write.
+    void VerifyStateRegisters(Core::System& system, std::span<const u64, 4> flags,
+                              std::span<const u64> writes, u32 last_break, bool changes);
 
     /// Retrieves information about a specific TIC entry from the TIC buffer.
     Texture::TICEntry GetTICEntry(u32 tic_index) const;
@@ -3463,6 +3480,10 @@ private:
         return value == nullptr || value[0] != '0';
     }();
     const bool perf_verify = VideoCommon::Nx2Perf::Verify();
+    const bool reg_block_verify = [] {
+        const char* value = std::getenv("EDEN_NX2_REG_BLOCK_VERIFY");
+        return value != nullptr && value[0] == '1';
+    }();
     /// Parameters that have been submitted to the macro call so far.
     std::vector<u32> macro_params;
 

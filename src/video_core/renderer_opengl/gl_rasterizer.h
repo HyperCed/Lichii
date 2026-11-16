@@ -267,6 +267,7 @@ private:
     bool has_written_global_memory = false;
 
     u32 last_clip_distance_mask = 0;
+    bool depth_zero_to_one = false;
 };
 
 } // namespace OpenGL

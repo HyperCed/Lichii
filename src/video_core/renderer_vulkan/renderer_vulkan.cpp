@@ -236,6 +236,34 @@ try
                       ? fmt::format("{} {}", device.GetVendorName(), GetDriverVersion(device))
                       : std::string{},
         .api = "Vulkan",
+        .api_version = GetReadableVersion(device.ApiVersion()),
+        .device_local_memory = device.GetDeviceLocalMemory(),
+        .extensions = {device.GetAvailableExtensions().begin(),
+                       device.GetAvailableExtensions().end()},
+        .features =
+            {
+                {"geometry_shader", device.IsGeometryShaderSupported()},
+                {"tessellation", device.IsTessellationSupported()},
+                {"mesh_shader", device.IsExtMeshShaderSupported()},
+                {"descriptor_buffer", device.IsExtDescriptorBufferSupported()},
+                {"buffer_device_address", device.IsBufferDeviceAddressSupported()},
+                {"push_descriptor", device.IsKhrPushDescriptorSupported()},
+                {"vertex_input_dynamic_state", device.IsExtVertexInputDynamicStateSupported()},
+                {"extended_dynamic_state", device.IsExtExtendedDynamicStateSupported()},
+                {"transform_feedback", device.IsExtTransformFeedbackSupported()},
+                {"conservative_rasterization", device.IsExtConservativeRasterizationSupported()},
+                {"line_rasterization", device.IsExtLineRasterizationSupported()},
+                {"depth_clip_control", device.IsExtDepthClipControlSupported()},
+                {"shader_float_controls", device.IsKhrShaderFloatControlsSupported()},
+                {"subgroup_size_control", device.IsExtSubgroupSizeControlSupported()},
+                {"vulkan_memory_model", device.IsVulkanMemoryModelSupported()},
+                {"cooperative_hmma", device.IsCooperativeHmmaSupported()},
+                {"sparse_binding", device.IsSparseBindingSupported()},
+                {"optimal_astc", device.IsOptimalAstcSupported()},
+                {"optimal_bcn", device.IsOptimalBcnSupported()},
+                {"formatless_image_load", device.IsFormatlessImageLoadSupported()},
+                {"pipeline_binary", device.IsKhrPipelineBinarySupported()},
+            },
     };
     Report();
 } catch (const vk::Exception& exception) {
@@ -459,15 +487,7 @@ void RendererVulkan::Report() const {
 vk::Buffer RendererVulkan::RenderToBuffer(std::span<const Tegra::FramebufferConfig> framebuffers,
                                           const Layout::FramebufferLayout& layout, VkFormat format,
                                           VkDeviceSize buffer_size) {
-    auto frame = [&]() {
-        Frame f{};
-        f.image =
-            CreateWrappedImage(memory_allocator, VkExtent2D{layout.width, layout.height}, format);
-        f.image_view = CreateWrappedImageView(device, f.image, format);
-        f.framebuffer = blit_capture.CreateFramebuffer(device, layout, *f.image_view, format);
-        return f;
-    }();
-
+    auto& frame = screenshot_frame;
     auto dst_buffer = CreateWrappedBuffer(memory_allocator, buffer_size, MemoryUsage::Download);
     blit_capture.DrawToFrame(device, rasterizer, &frame, framebuffers, layout, 1, format,
                              CaptureHdrPresent());

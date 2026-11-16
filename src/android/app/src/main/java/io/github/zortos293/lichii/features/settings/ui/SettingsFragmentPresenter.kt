@@ -534,6 +534,7 @@ class SettingsFragmentPresenter(
                 add(IntSetting.FSR_SHARPENING_SLIDER.key)
             }
             add(IntSetting.RENDERER_ANTI_ALIASING.key)
+            add(IntSetting.OOT_ANTI_ALIASING.key)
 
             add(HeaderSetting(R.string.advanced))
 

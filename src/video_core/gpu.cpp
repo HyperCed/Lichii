@@ -3,12 +3,14 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <list>
 #include <memory>
+#include <optional>
 #include <utility>
 
 #include "common/assert.h"
@@ -32,6 +34,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/engines/maxwell_dma.h"
+#include "video_core/gpu_trace/recorder.h"
 #include "video_core/gpu.h"
 #include "video_core/pending_maps.h"
 #include "video_core/gpu_thread.h"
@@ -41,6 +44,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_async_readback.h"
+#include "video_core/nx2_backx.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
@@ -112,6 +116,33 @@ struct GPU::Impl {
 
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
+        // ~900 calls a frame, most with nothing collected: gather (applying_writes_mutex and two
+        // locks per core's manager) only when a manager shows a write. One collected after this
+        // check is gathered by the next call, as one collected just after the gather would be.
+        const auto managers = system.GetGPUDirtyMemoryManager();
+        const auto collects = [&managers] {
+            u64 sum = 0;
+            for (const Core::GPUDirtyMemoryManager& manager : managers) {
+                sum += manager.Collects();
+            }
+            return sum;
+        };
+        const u64 collects_before = VideoCommon::BackX::g_verify ? collects() : 0;
+        if (std::ranges::none_of(managers, &Core::GPUDirtyMemoryManager::MayHavePending)) {
+            if (VideoCommon::BackX::g_verify) {
+                const auto first_write = ApplyCollectedWrites();
+                VideoCommon::BackX::SkippedGather(first_write.has_value(),
+                                                  collects() != collects_before,
+                                                  first_write.value_or(std::pair<DAddr, u64>{}));
+            }
+            return;
+        }
+        ApplyCollectedWrites();
+    }
+
+    /// Gathers the CPU writes collected into GPU-written pages and applies them to the caches.
+    /// Returns the first of them, if there were some.
+    std::optional<std::pair<DAddr, u64>> ApplyCollectedWrites() {
         std::vector<std::pair<DAddr, u64>> writes;
         {
             // Gathered writes stay pending (ForEachPendingCpuWrite) until they are applied: a
@@ -122,7 +153,7 @@ struct GPU::Impl {
                 [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
             system.GatherGPUDirtyMemory(callback_writes);
             if (writes.empty()) {
-                return;
+                return std::nullopt;
             }
             applying_writes.push_back(&writes);
         }
@@ -133,6 +164,7 @@ struct GPU::Impl {
             std::erase(applying_writes, &writes);
         };
         renderer->ReadRasterizer()->OnCacheInvalidations(writes);
+        return writes.front();
     }
 
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
@@ -198,9 +230,33 @@ struct GPU::Impl {
     }
 
     [[nodiscard]] u64 GetTicks() const {
-        return ReadGpuTimestamp(system.CoreTiming(), g_nx2_ampere.load(std::memory_order_relaxed),
-                                Settings::values.gpu_clock.GetValue(),
+        const bool ampere = g_nx2_ampere.load(std::memory_order_relaxed) && !LegacyTimestamps();
+        return ReadGpuTimestamp(system.CoreTiming(), ampere, Settings::values.gpu_clock.GetValue(),
                                 ampere_anchor.load(std::memory_order_relaxed));
+    }
+
+    /// Whether the running title keeps GPU tick timestamps (UsesLegacyAmpereTimestamps). Known
+    /// once the application process exists; until then (program id 0) nanoseconds are used. An
+    /// application change (NotifyApplicationChanged) replaces the cached answer.
+    [[nodiscard]] bool LegacyTimestamps() const {
+        s8 known = legacy_timestamps.load(std::memory_order_relaxed);
+        if (known < 0) {
+            const u64 program_id = system.GetApplicationProcessProgramID();
+            if (program_id == 0) {
+                return false;
+            }
+            const s8 found = UsesLegacyAmpereTimestamps(program_id) ? 1 : 0;
+            if (legacy_timestamps.compare_exchange_strong(known, found,
+                                                          std::memory_order_relaxed)) {
+                known = found;
+            }
+        }
+        return known != 0;
+    }
+
+    void NotifyApplicationChanged(u64 program_id) {
+        legacy_timestamps.store(UsesLegacyAmpereTimestamps(program_id) ? 1 : 0,
+                                std::memory_order_relaxed);
     }
 
     void RendererFrameEndNotify() {
@@ -221,6 +277,8 @@ struct GPU::Impl {
 
     void NotifyShutdown() {
         gpu_thread.NotifyShutdown();
+        // Ends a recording while guest memory and the SMMU it holds references in still exist.
+        VideoCommon::GpuTrace::OnGpuShutdown();
         {
             // The GPU threads stopped: no sync operation runs anymore. Guest threads still run
             // until the kernel suspends them, and one waiting for a read's flush (OnCPURead)
@@ -258,8 +316,8 @@ struct GPU::Impl {
     // Queued without waiting, also with synchronous GPU: callers hold the nx2:gpu region, GPU
     // memory registry or address space lock, which the GPU thread takes when work queued earlier
     // writes into a lazily backed sparse region (BackSparseWrite).
-    void RunInOrder(std::function<void()>&& func) {
-        gpu_thread.Run(std::move(func), true);
+    void RunInOrder(std::function<void()>&& func, bool before_later_reads) {
+        gpu_thread.Run(std::move(func), true, before_later_reads);
     }
 
     void MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func) {
@@ -327,6 +385,7 @@ struct GPU::Impl {
 
     /// Notify rasterizer that any caches of the specified region should be invalidated
     void InvalidateRegion(DAddr addr, u64 size, bool preserve_gpu_writes) {
+        VideoCommon::GpuTrace::NoteDeviceWrite(addr, size);
         if (preserve_gpu_writes) {
             VideoCore::RasterizerInterface* rasterizer = renderer->ReadRasterizer();
             if (!rasterizer->TryCacheInvalidation(addr, size)) {
@@ -352,6 +411,7 @@ struct GPU::Impl {
     }
 
     void RequestComposite(std::vector<Tegra::FramebufferConfig>&& layers, std::vector<Service::Nvidia::NvFence>&& fences) {
+        VideoCommon::GpuTrace::NotePresent(layers, fences);
         const size_t num_fences{fences.size()};
         size_t current_request_counter{};
         if (num_fences != 0) {
@@ -441,6 +501,7 @@ struct GPU::Impl {
     std::list<std::function<void()>> sync_requests;
     std::atomic<u64> current_sync_fence{};
     std::atomic<AmpereAnchor> ampere_anchor{};
+    mutable std::atomic<s8> legacy_timestamps{-1};
     u64 last_sync_fence{};
 
     VideoCommon::PendingMaps pending_maps;
@@ -480,6 +541,15 @@ std::shared_ptr<Control::ChannelState> GPU::AllocateChannel() {
 
 void GPU::InitChannel(Control::ChannelState& to_init, u64 program_id) {
     impl->InitChannel(to_init, program_id);
+}
+
+std::vector<std::shared_ptr<Control::ChannelState>> GPU::Channels() const {
+    std::vector<std::shared_ptr<Control::ChannelState>> channels;
+    for (const auto& [id, channel] : impl->channels) {
+        channels.push_back(channel);
+    }
+    std::ranges::sort(channels, {}, [](const auto& channel) { return channel->bind_id; });
+    return channels;
 }
 
 void GPU::BindChannel(s32 channel_id) {
@@ -612,6 +682,10 @@ u64 GPU::GetTicks() const {
     return impl->GetTicks();
 }
 
+void GPU::NotifyApplicationChanged(u64 program_id) {
+    impl->NotifyApplicationChanged(program_id);
+}
+
 bool GPU::IsAsync() const {
     return impl->is_async;
 }
@@ -660,8 +734,8 @@ void GPU::FlushRegion(DAddr addr, u64 size) {
     impl->FlushRegion(addr, size);
 }
 
-void GPU::RunInOrder(std::function<void()>&& func) {
-    impl->RunInOrder(std::move(func));
+void GPU::RunInOrder(std::function<void()>&& func, bool before_later_reads) {
+    impl->RunInOrder(std::move(func), before_later_reads);
 }
 
 void GPU::MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func) {

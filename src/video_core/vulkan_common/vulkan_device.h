@@ -20,7 +20,10 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/fsr4_support.h"
+#include "video_core/vulkan_common/descriptor_limits.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+
+#include <vulkan/vulkan_beta.h>
 
 VK_DEFINE_HANDLE(VmaAllocator)
 VK_DEFINE_HANDLE(VmaPool)
@@ -67,6 +70,7 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(EXT, ExtendedDynamicState, EXTENDED_DYNAMIC_STATE, extended_dynamic_state)             \
     FEATURE(EXT, ExtendedDynamicState2, EXTENDED_DYNAMIC_STATE_2, extended_dynamic_state2)         \
     FEATURE(EXT, ExtendedDynamicState3, EXTENDED_DYNAMIC_STATE_3, extended_dynamic_state3)         \
+    FEATURE(EXT, ImageCompressionControl, IMAGE_COMPRESSION_CONTROL, image_compression_control)    \
     FEATURE(EXT, 4444Formats, 4444_FORMATS, format_a4b4g4r4)                                       \
     FEATURE(EXT, IndexTypeUint8, INDEX_TYPE_UINT8, index_type_uint8)                               \
     FEATURE(EXT, LineRasterization, LINE_RASTERIZATION, line_rasterization)                        \
@@ -258,8 +262,10 @@ public:
     bool IsFormatSupported(VkFormat wanted_format, VkFormatFeatureFlags wanted_usage,
                            FormatType format_type) const;
 
-    /// Reports a device loss.
-    void ReportLoss() const;
+    /// Logs a device loss and what the driver knows about it, then ends the process. Nothing can
+    /// run on a lost device, and the vk::Exception a caller would throw ends it anyway, as an
+    /// unhandled exception on whichever thread saw the loss (#1934).
+    [[noreturn]] void ReportLoss() const;
 
     /// Logs what VK_EXT_device_fault reports about a device loss.
     void ReportDeviceFault() const;
@@ -510,6 +516,12 @@ FN_MAX_LIMIT_LIST
         return features.descriptor_indexing.shaderStorageTexelBufferArrayNonUniformIndexing;
     }
 
+    /// Returns true if storage buffer pointers can be chosen per invocation and decorated NonUniform.
+    bool IsNonUniformStorageBufferPointerSupported() const {
+        return features.variable_pointer.variablePointersStorageBuffer &&
+               (instance_version >= VK_API_VERSION_1_2 || extensions.descriptor_indexing);
+    }
+
     /// Returns true if the device supports float64 natively.
     bool IsFloat64Supported() const {
         return features.features.shaderFloat64;
@@ -566,9 +578,12 @@ FN_MAX_LIMIT_LIST
         return is_warp_potentially_bigger;
     }
 
-    /// Returns true if the device can be forced to use the guest warp size.
+    /// Returns true if the device can be forced to use the guest warp size. Lavapipe's
+    /// subgroups are 8 wide and can't be forced to 32.
     bool IsGuestWarpSizeSupported(VkShaderStageFlagBits stage) const {
-        return properties.subgroup_size_control.requiredSubgroupSizeStages & stage;
+        const auto& control = properties.subgroup_size_control;
+        return (control.requiredSubgroupSizeStages & stage) != 0 &&
+               control.minSubgroupSize <= GuestWarpSize && GuestWarpSize <= control.maxSubgroupSize;
     }
 
     /// Returns true if the device supports the provided subgroup feature.
@@ -588,6 +603,17 @@ FN_MAX_LIMIT_LIST
     /// Returns the maximum number of push descriptors.
     u32 MaxPushDescriptors() const {
         return properties.push_descriptor.maxPushDescriptors;
+    }
+
+    SampledDescriptorLimits CoreSampledLimits() const {
+        return CoreSampledDescriptorLimits(properties.properties.limits);
+    }
+
+    /// Returns the sampled descriptor limits of sets from update-after-bind pools, when they are
+    /// larger than the core limits.
+    std::optional<SampledDescriptorLimits> UpdateAfterBindSampledLimits() const {
+        return UpdateAfterBindSampledDescriptorLimits(properties.properties.limits,
+                                                      properties.descriptor_indexing);
     }
 
     /// Returns true if robust buffer access is enabled on the device.
@@ -877,6 +903,13 @@ FN_MAX_LIMIT_LIST
         return extensions.color_write_enable;
     }
 
+    /// Returns true if colour images are created without delta colour compression (RADV before
+    /// GFX10: images in the GENERAL layout are never DCC compressed there, and every transfer
+    /// layout round trip decompresses them in full).
+    bool DisablesColorCompression() const {
+        return extensions.image_compression_control;
+    }
+
     /// Returns true if the device supports VK_EXT_border_color_swizzle.
     bool IsExtBorderColorSwizzleSupported() const {
         return extensions.border_color_swizzle;
@@ -1102,6 +1135,12 @@ FN_MAX_LIMIT_LIST
         return device_access_memory;
     }
 
+    /// Size of the largest device-local heap (with EDEN_NX2_VRAM_LIMIT_MIB applied). Unlike
+    /// GetDeviceLocalMemory() this is the card's memory, not a budget with a reserve taken off.
+    u64 GetDeviceLocalHeapSize() const {
+        return main_heap_size;
+    }
+
     bool CanReportMemoryUsage() const {
         return extensions.memory_budget;
     }
@@ -1113,6 +1152,9 @@ FN_MAX_LIMIT_LIST
     /// budget. 0 without the extension. The unused part of the allocator's blocks is not
     /// subtracted: see GetDeviceMemorySlack().
     u64 GetDeviceMemoryBudget() const;
+
+    /// GetDeviceMemoryBudget() before the cap an integrated GPU gets: the heap's own budget.
+    u64 GetDeviceHeapMemoryBudget() const;
 
     /// Memory the allocator holds from the driver in the main device-local heap but has no
     /// allocation in (the unused part of its blocks). GetDeviceMemoryUsage() does not count it,
@@ -1260,14 +1302,18 @@ FN_MAX_LIMIT_LIST
     /// NVIDIA's and AMD's drivers keep a disk cache of built pipelines of their own, so the
     /// emulator keeps none on top: a VkPipelineCache only kept every pipeline the title ever built
     /// in host memory (title 1: a 245 MB file, ~0.35 GB of RAM for the session) and copied it whole
-    /// at each save, which stalled frames, and pipelines built no slower without it.
-    bool DriverCachesPipelines() const noexcept {
-        return properties.driver.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY ||
-               properties.driver.driverID == VK_DRIVER_ID_AMD_PROPRIETARY;
-    }
+    /// at each save, which stalled frames, and pipelines built no slower without it. RADV keeps
+    /// one too through Mesa's shader cache, unless it is disabled.
+    bool DriverCachesPipelines() const noexcept;
 
     bool IsMoltenVK() const noexcept {
         return properties.driver.driverID == VK_DRIVER_ID_MOLTENVK;
+    }
+
+    /// Samplers may use a nonzero mipLodBias (false on portability subset devices without it).
+    bool SupportsSamplerMipLodBias() const {
+        return !loaded_extensions.contains(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME) ||
+               portability_subset_features.samplerMipLodBias == VK_TRUE;
     }
 
     /// The multiple vertex input binding strides must be. Metal needs 4 bytes, which MoltenVK
@@ -1378,6 +1424,7 @@ private:
         VkPhysicalDeviceSubgroupProperties subgroup_properties{};
         VkPhysicalDeviceFloatControlsProperties float_controls{};
         VkPhysicalDevicePushDescriptorPropertiesKHR push_descriptor{};
+        VkPhysicalDeviceDescriptorIndexingProperties descriptor_indexing{};
         VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptor_buffer{};
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_size_control{};
         VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback{};
@@ -1398,6 +1445,8 @@ private:
 
     VkPhysicalDeviceFeatures2 features2{};
     VkPhysicalDeviceFaultFeaturesEXT device_fault_features{};
+    /// Enabled as the driver reports them (VK_KHR_portability_subset devices only).
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR portability_subset_features{};
     VkPhysicalDeviceProperties2 properties2{};
 
     // Misc features
@@ -1445,6 +1494,7 @@ private:
     std::vector<size_t> valid_heap_memory;                   ///< Heaps used.
     size_t main_heap{};       ///< Largest device-local heap, where images live.
     u64 heap_size_limit{};    ///< EDEN_NX2_VRAM_LIMIT_MIB for device-local heaps, 0 if unset.
+    u64 main_heap_size{};     ///< Size of main_heap, with heap_size_limit applied.
 
     /// Format properties dictionary.
     ::Common::unordered_map<VkFormat, VkFormatProperties> format_properties;

@@ -620,7 +620,8 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
                                       VK_IMAGE_USAGE_SAMPLED_BIT);
         sl::Resource depth = Resource(in.depth.image, in.depth.view, in.depth.format,
-                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
+                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                      in.depth_size.width != 0 ? in.depth_size : in.render_size,
                                       VK_IMAGE_USAGE_SAMPLED_BIT);
         sl::Resource motion = Resource(in.motion_vectors.image, in.motion_vectors.view,
                                        in.motion_vectors.format,

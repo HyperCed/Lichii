@@ -421,7 +421,9 @@ TEST_CASE("Native accesses through a cbuf pointer or a pointer loaded from it bi
     const bool phi = GENERATE(false, true);
     CAPTURE(phi);
     DirectOrLoadedPointer program;
-    static_cast<void>(program.record->LoadGlobal128(program.RecordAddress(phi)));
+    // RecordAddress creates the emitter, so it has to run before record is used.
+    const IR::U64 address{program.RecordAddress(phi)};
+    static_cast<void>(program.record->LoadGlobal128(address));
 
     CHECK(program.fixture.TrackedOffsets() == std::vector<u32>{0x30, 0x30});
     CHECK(program.fixture.program.info.native_global_bounds);
@@ -466,7 +468,8 @@ TEST_CASE("Loaded pointers that compete with a pair do not take the last storage
           "[shader][storage_buffer]") {
     // 31 more pointers fill every binding with c0[0x30]; the loaded pointer would be the 33rd.
     DirectOrLoadedPointer program;
-    static_cast<void>(program.record->LoadGlobal128(program.RecordAddress(false)));
+    const IR::U64 address{program.RecordAddress(false)};
+    static_cast<void>(program.record->LoadGlobal128(address));
     IR::IREmitter ir{program.fixture.entry};
     for (u32 slot = 0; slot < Shader::Info::MAX_SSBOS - 1; ++slot) {
         const u32 offset{0x100 + slot * 8};
@@ -626,4 +629,28 @@ TEST_CASE("NVN fallback descriptors use guest slots rather than compact binding 
     auto reversed = descriptors;
     std::ranges::reverse(reversed);
     CHECK(selected(reversed) == std::vector<u32>{0x400, 0x340});
+}
+
+TEST_CASE("Iterator analysis handles deep loop-carried shader graphs",
+          "[shader][storage_buffer]") {
+    KernelProgram fixture;
+    fixture.env.native = true;
+    fixture.entry.AddBranch(&fixture.loop);
+    fixture.loop.AddBranch(&fixture.loop);
+    fixture.program.blocks = {&fixture.entry, &fixture.loop};
+    fixture.program.post_order_blocks = {&fixture.loop, &fixture.entry};
+    std::vector<IR::Inst*> phis;
+    phis.reserve(20000);
+    for (size_t index = 0; index < 20000; ++index) {
+        fixture.loop.AppendNewInst(IR::Opcode::Phi, {});
+        phis.push_back(&fixture.loop.back());
+        phis.back()->SetFlags(IR::Type::U32);
+    }
+    for (size_t index = 0; index < phis.size(); ++index) {
+        phis[index]->AddPhiOperand(&fixture.entry, IR::Value{0U});
+        phis[index]->AddPhiOperand(&fixture.loop, IR::Value{phis[(index + 1) % phis.size()]});
+    }
+    IR::IREmitter entry{fixture.entry};
+    entry.WriteGlobal32(Address(entry, Word(entry, 0x310), Word(entry, 0x314)), entry.Imm32(1));
+    CHECK(fixture.TrackedOffsets() == std::vector<u32>{0x310});
 }

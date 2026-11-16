@@ -120,6 +120,7 @@ private:
 
     std::atomic<s64> m_cpu_time{};
     std::atomic_bool m_mkw_dynamic_fps_patch_applied{};
+    std::atomic<u64> m_mkw_frame_mode_address{};
     std::atomic<u64> m_frame_interval_address{};
     std::atomic<u64> m_frame_interval_source_address{};
     std::atomic<s64> m_num_process_switches{};
@@ -191,6 +192,15 @@ public:
 
     void SetMkwDynamicFpsPatchApplied(bool applied) {
         m_mkw_dynamic_fps_patch_applied.store(applied, std::memory_order_relaxed);
+    }
+
+    /// Mario Kart World's frame mode word that the 60 FPS mode switches (loader/nso.cpp), or 0.
+    u64 GetMkwFrameModeAddress() const {
+        return m_mkw_frame_mode_address.load(std::memory_order_relaxed);
+    }
+
+    void SetMkwFrameModeAddress(u64 address) {
+        m_mkw_frame_mode_address.store(address, std::memory_order_relaxed);
     }
 
     /// Hyrule Warriors' frame interval global (see nx2_frame_interval.h), or 0 when not found.

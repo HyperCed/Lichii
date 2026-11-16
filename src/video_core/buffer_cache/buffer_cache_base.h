@@ -12,7 +12,6 @@
 #include <bit>
 #include <chrono>
 #include <functional>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -50,6 +49,7 @@
 #include "video_core/nx2_download_trace.h"
 #include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_owed_words.h"
 #include "video_core/rasterizer_download_area.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
@@ -235,6 +235,8 @@ class BufferCache : public VideoCommon::ChannelSetupCaches<BufferCacheChannelInf
 
     struct OverlapResult {
         boost::container::small_vector<BufferId, 16> ids;
+        /// Large buffers that only touch the range: deleted, not joined
+        boost::container::small_vector<BufferId, 2> cut;
         DAddr begin;
         DAddr end;
         bool has_stream_leap = false;
@@ -359,37 +361,6 @@ public:
     }
 
     bool InlineMemory(DAddr dest_address, size_t copy_size, std::span<const u8> inlined_buffer);
-
-    /// List-fed grid macros (nx2_list_grid.h): an inline write whose words at the `patches`'
-    /// offsets are markers. It is uploaded at once, not left to a later invalidation that would
-    /// upload guest memory's markers over the copies. Then `copy(buffer, offset, patch)` records
-    /// the host GPU's copy of the patch's kept word over it; those words are GPU-written from now
-    /// on, and registered to their list until another write reaches them (Nx2KeptWordList).
-    template <typename Patch, typename Copy>
-    void Nx2InlineKeptWords(DAddr dest_address, std::span<const u8> data,
-                            std::span<const Patch> patches, Copy&& copy) {
-        InlineMemoryImplementation(dest_address, data.size(), data);
-        if (nx2_kept_words.size() >= 0x10000) {
-            nx2_kept_words.clear(); // Only the QMD reads' fallback to the host GPU's words then
-        }
-        for (const Patch& patch : patches) {
-            const DAddr address = dest_address + patch.offset;
-            const BufferId buffer_id = FindBuffer(address, sizeof(u32), false);
-            Buffer& buffer = slot_buffers[buffer_id];
-            const u32 offset = buffer.Offset(address);
-            copy(buffer, offset, patch);
-            // As a3acb026c1 does for indirect arguments: no later upload is reordered ahead.
-            buffer.MarkUsage(offset, sizeof(u32));
-            MarkWrittenBuffer(buffer_id, address, sizeof(u32));
-            nx2_kept_words[address] = {patch.keep_id, patch.index};
-        }
-    }
-    /// The list and word Nx2InlineKeptWords last patched at `device_addr`, unless a CPU, inline,
-    /// DMA or storage write reached the word since.
-    [[nodiscard]] std::optional<std::pair<u64, u32>> Nx2KeptWordList(DAddr device_addr) const {
-        const auto it = nx2_kept_words.find(device_addr);
-        return it != nx2_kept_words.end() ? std::optional{it->second} : std::nullopt;
-    }
 
     void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr, u32 size);
 
@@ -708,7 +679,97 @@ private:
 
     void TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept;
 
-    bool SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size);
+    /// Uploads the CPU-modified bytes of [device_addr, +size) into `buffer` for `reader`, and the
+    /// GPU-written list words owed there over their placeholders (Nx2ListIndirect). Whether
+    /// nothing had to be uploaded.
+    bool SynchronizeBuffer(
+        Buffer& buffer, DAddr device_addr, u32 size,
+        Tegra::Nx2ListIndirect::OwedReader reader = Tegra::Nx2ListIndirect::OwedReader::Bind);
+
+    bool UploadModifiedMemory(Buffer& buffer, DAddr device_addr, u32 size);
+
+    /// The host GPU reads [device_addr, +size) for `reader` from `handle` at `offset`, filled
+    /// already: copies the GPU-written list words owed there over their placeholders. Whether it
+    /// copied any.
+    template <typename Handle>
+    bool Nx2PatchOwed(DAddr device_addr, u32 size, Handle handle, u64 offset,
+                      Tegra::Nx2ListIndirect::OwedReader reader) {
+        if constexpr (requires { runtime.Nx2Owes(device_addr, u64{size}); }) {
+            return runtime.Nx2PatchOwed(
+                device_addr, size, handle, offset,
+                [this](DAddr word) {
+                    return device_memory.template Read<u32>(word);
+                },
+                reader);
+        } else {
+            return false;
+        }
+    }
+
+    /// The host GPU wrote [device_addr, +size): the list words owed there are owed no more.
+    void Nx2ForgetOwed(DAddr device_addr, u64 size) {
+        if constexpr (requires { runtime.Nx2Owes(device_addr, size); }) {
+            runtime.Nx2ForgetOwed(device_addr, size);
+        }
+    }
+
+    /// Lands the GPU-written list words owed in [device_addr, +size) in guest memory at once, as
+    /// FlushRegion does (waits for the host GPU), and tells the buffer cache as
+    /// RasterizerVulkan::InvalidateCachedWrites would.
+    void Nx2LandOwed(DAddr device_addr, u64 size) {
+        if constexpr (requires { runtime.Nx2Owes(device_addr, size); }) {
+            runtime.Nx2LandOwed(
+                device_addr, size, Tegra::Nx2ListIndirect::OwedReader::Flush,
+                [this](DAddr word, u32 value, u32 real) {
+                    if (!Tegra::Nx2ListIndirect::LandOwedWord(device_memory, word, value, real)) {
+                        return false;
+                    }
+                    const std::array<std::pair<DAddr, size_t>, 1> written{{{word, sizeof(u32)}}};
+                    ClaimCpuWrites(written);
+                    WriteMemory(word, sizeof(u32), true, true);
+                    return true;
+                });
+        }
+    }
+
+    /// The host GPU writes [device_addr, +size) of `buffer`: an owed list word it covers only in
+    /// part gets its slot word's other bytes in `buffer` first, and the range grows over the
+    /// whole word, so the write's download lands all of it in guest memory.
+    void Nx2WidenOverOwed(Buffer& buffer, DAddr& device_addr, u32& size) {
+        if constexpr (requires { runtime.Nx2OwedSpan(device_addr, u64{size}); buffer.Handle(); }) {
+            const auto owed = runtime.Nx2OwedSpan(device_addr, size);
+            if (!owed) {
+                return;
+            }
+            const auto patch = [&](DAddr begin, DAddr end) {
+                if (begin >= end || !buffer.IsInBounds(begin, end - begin)) {
+                    return false;
+                }
+                const u32 offset = buffer.Offset(begin);
+                const u32 bytes = static_cast<u32>(end - begin);
+                if (!Nx2PatchOwed(begin, bytes, buffer.Handle(), offset,
+                                  Tegra::Nx2ListIndirect::OwedReader::Bind)) {
+                    return false;
+                }
+                buffer.MarkUsage(offset, bytes);
+                return true;
+            };
+            const DAddr end = device_addr + size;
+            const DAddr begin = patch(owed->first, device_addr) ? owed->first : device_addr;
+            const DAddr last = patch(end, owed->second) ? owed->second : end;
+            device_addr = begin;
+            size = static_cast<u32>(last - begin);
+        }
+    }
+
+    /// Whether [device_addr, +size) holds GPU-written list words owed over their placeholders.
+    [[nodiscard]] bool Nx2Owes(DAddr device_addr, u64 size) const {
+        if constexpr (requires { runtime.Nx2Owes(device_addr, size); }) {
+            return runtime.Nx2Owes(device_addr, size);
+        } else {
+            return false;
+        }
+    }
 
     /// SynchronizeBuffer for vertex buffer slots 0-31 and the index buffer (slot 32).
     void SynchronizeGeometryBuffer(u32 slot, BufferId buffer_id, DAddr device_addr, u32 size);
@@ -799,18 +860,6 @@ private:
 
     /// Re-dirties repacked vertex buffers whose source data was written since they were bound.
     void RefreshRepackedVertexBuffers();
-
-    void Nx2ForgetKeptWords(DAddr device_addr, u64 size) {
-        if (nx2_kept_words.empty()) {
-            return;
-        }
-        auto it = nx2_kept_words.lower_bound(device_addr & ~DAddr{3});
-        while (it != nx2_kept_words.end() && it->first < device_addr + size) {
-            it = nx2_kept_words.erase(it);
-        }
-    }
-    /// Nx2InlineKeptWords' patched words: keep id and word index by device address.
-    std::map<DAddr, std::pair<u64, u32>> nx2_kept_words;
 
     void InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                     std::span<const u8> inlined_buffer);
@@ -1151,13 +1200,18 @@ private:
     };
     /// Reads of a page's writes in a row before its writes get early downloads.
     static constexpr u16 EarlyAfterReads = 2;
-    /// Writes in a row without a read that stop them.
-    static constexpr u16 MaxUnreadWrites = 4;
-    static constexpr size_t MaxReadBackPages = 64;
+    /// Writes in a row without a read that stop them. A page the guest reads every few frames
+    /// keeps them: Ocarina of Time reads each of its read-back pages every 5 to 40 frames, and
+    /// several dispatches write it in between.
+    static constexpr u16 MaxUnreadWrites = 256;
+    /// Learned pages; the one read longest ago makes room. Ocarina of Time reads back ~220 pages
+    /// over a few seconds.
+    static constexpr size_t MaxReadBackPages = 512;
     /// Early download bytes a frame, and early downloads not yet in guest memory: past them, reads
-    /// flush on demand.
-    static constexpr u64 EarlyBytesPerFrame = 1_MiB;
-    static constexpr u32 MaxPendingEarlyDownloads = 32;
+    /// flush on demand. These limits only decide which downloads are recorded early, never what a
+    /// read finds: a read that no early download covers flushes.
+    static constexpr u64 EarlyBytesPerFrame = 8_MiB;
+    static constexpr u32 MaxPendingEarlyDownloads = 512;
     std::vector<ReadBackPage> read_back_pages; ///< Sorted by page
     /// The first and last page of read_back_pages (MayBeReadBackPage), set under `mutex`.
     std::atomic<DAddr> read_back_first{~DAddr{0}};
@@ -1193,10 +1247,12 @@ private:
     std::vector<MultiRangeSegment> graphics_segments;
     std::vector<MultiRangeSegment> compute_segments;
     u64 frame_tick = 0;
+    /// Buffers created since the last TickFrame; ResolveOverlaps does not cut these
+    std::vector<BufferId> frame_created_buffers;
     /// EDEN_NX2_TABLE_POINTER_TRACE: last table entry and size bound per table pointer slot.
     std::unordered_map<u64, std::pair<GPUVAddr, u32>> traced_table_pointers;
     u64 total_used_memory = 0;
-    u64 buffer_bytes = 0; ///< The buffers' own size (total_used_memory may be the device's)
+    u64 buffer_bytes = 0; ///< The buffers' allocated size (total_used_memory may be the device's)
     u64 minimum_memory = 0;
     u64 critical_memory = 0;
     BufferId inline_buffer_id;

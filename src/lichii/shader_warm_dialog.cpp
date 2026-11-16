@@ -188,8 +188,6 @@ void ShaderWarmDialog::OnFinished(const ShaderWarm::Result& result, bool stopped
                        ? tr("This game keeps its shaders in a format Lichii can't read, so none "
                             "are prepared from the game files.")
                        : tr("The game files have no compute shaders to prepare.");
-            text += QLatin1Char(' ') +
-                    tr("The shaders your earlier play sessions saved are still precached.");
         } else {
             text = tr("Compute programs: %L1")
                        .arg(static_cast<qulonglong>(result.compute_programs));
