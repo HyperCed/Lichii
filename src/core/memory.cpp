@@ -9,9 +9,9 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <optional>
-#include <set>
 #include <span>
 #include <thread>
 #include <type_traits>
@@ -664,11 +664,12 @@ struct Memory::Impl {
             const bool cached = std::as_const(current_page_table->entries)[page].Type() ==
                                 Common::PageType::RasterizerCachedMemory;
             armed_read_trap_count.fetch_add(1, std::memory_order_relaxed);
-            if (!cached || !armed_read_traps.insert(page).second) {
+            if (!cached || armed_read_traps.find(page) != armed_read_traps.end()) {
                 armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
                 protect_run();
                 continue;
             }
+            armed_read_traps.emplace(page, ++read_trap_serial);
             if (run_pages == 0) {
                 run_begin = page;
             }
@@ -683,7 +684,8 @@ struct Memory::Impl {
         }
         std::scoped_lock lk{read_trap_mutex};
         const auto it = armed_read_traps.lower_bound(vaddr >> LICHII_PAGEBITS);
-        return it != armed_read_traps.end() && *it <= ((vaddr + size - 1) >> LICHII_PAGEBITS);
+        return it != armed_read_traps.end() &&
+               it->first <= ((vaddr + size - 1) >> LICHII_PAGEBITS);
     }
 
     /// Takes read permission away again from armed pages that were just cached again.
@@ -694,8 +696,9 @@ struct Memory::Impl {
         std::scoped_lock lk{read_trap_mutex};
         const u64 page_end = ((vaddr + size - 1) >> LICHII_PAGEBITS) + 1;
         for (auto it = armed_read_traps.lower_bound(vaddr >> LICHII_PAGEBITS);
-             it != armed_read_traps.end() && *it < page_end; ++it) {
-            HostProtect(*it << LICHII_PAGEBITS, LICHII_PAGESIZE, Common::MemoryPermission{});
+             it != armed_read_traps.end() && it->first < page_end; ++it) {
+            HostProtect(it->first << LICHII_PAGEBITS, LICHII_PAGESIZE,
+                        Common::MemoryPermission{});
         }
     }
 
@@ -707,10 +710,10 @@ struct Memory::Impl {
         std::scoped_lock lk{read_trap_mutex};
         const u64 page_end = ((vaddr + size - 1) >> LICHII_PAGEBITS) + 1;
         auto it = armed_read_traps.lower_bound(vaddr >> LICHII_PAGEBITS);
-        while (it != armed_read_traps.end() && *it < page_end) {
+        while (it != armed_read_traps.end() && it->first < page_end) {
             // Still cached (this read came through the rasterizer path): writes stay trapped.
-            HostProtect(*it << LICHII_PAGEBITS, LICHII_PAGESIZE,
-                                 Common::MemoryPermission::Read);
+            HostProtect(it->first << LICHII_PAGEBITS, LICHII_PAGESIZE,
+                        Common::MemoryPermission::Read);
             it = armed_read_traps.erase(it);
             armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
         }
@@ -719,7 +722,16 @@ struct Memory::Impl {
     /// For a backend that can't read a cached page through the slow path: after a slow-path read
     /// the page's data is current, yet its trap may still stand (the read was inside the area a
     /// previous download cleared, so nothing disarmed it).
-    bool GrantCachedPageRead(u64 vaddr) {
+    u64 ReadTrapToken(u64 vaddr) {
+        if (armed_read_trap_count.load(std::memory_order_relaxed) == 0) {
+            return 0;
+        }
+        std::scoped_lock lk{read_trap_mutex};
+        const auto it = armed_read_traps.find(vaddr >> LICHII_PAGEBITS);
+        return it == armed_read_traps.end() ? 0 : it->second;
+    }
+
+    bool GrantCachedPageRead(u64 vaddr, u64 expected_token) {
         const u64 page = vaddr >> LICHII_PAGEBITS;
         if (!AddressSpaceContains(*current_page_table, vaddr, 1) ||
             std::as_const(current_page_table->entries)[page].Type() !=
@@ -727,7 +739,12 @@ struct Memory::Impl {
             return false;
         }
         std::scoped_lock lk{read_trap_mutex};
-        if (armed_read_traps.erase(page) != 0) {
+        auto it = armed_read_traps.find(page);
+        if (it != armed_read_traps.end() && it->second != expected_token) {
+            return false;
+        }
+        if (it != armed_read_traps.end()) {
+            armed_read_traps.erase(it);
             armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
         }
         // Still cached: writes stay trapped.
@@ -1080,7 +1097,8 @@ struct Memory::Impl {
     std::array<VideoCore::RasterizerDownloadArea, Core::Hardware::NUM_CPU_CORES> rasterizer_read_areas{};
     std::array<u64, Core::Hardware::NUM_CPU_CORES> read_area_generations{};
     std::atomic<u64> read_trap_generation{};
-    std::set<u64> armed_read_traps;
+    std::map<u64, u64> armed_read_traps;
+    u64 read_trap_serial{};
     std::atomic<size_t> armed_read_trap_count{};
     std::mutex read_trap_mutex;
     std::array<GPUDirtyState, Core::Hardware::NUM_CPU_CORES> rasterizer_write_areas{};
@@ -1299,8 +1317,12 @@ void Memory::MarkRegionDebug(Common::ProcessAddress vaddr, u64 size, bool debug)
     impl->MarkRegionDebug(GetInteger(vaddr), size, debug);
 }
 
-bool Memory::GrantCachedPageRead(Common::ProcessAddress vaddr) {
-    return impl->GrantCachedPageRead(GetInteger(vaddr));
+u64 Memory::ReadTrapToken(Common::ProcessAddress vaddr) {
+    return impl->ReadTrapToken(GetInteger(vaddr));
+}
+
+bool Memory::GrantCachedPageRead(Common::ProcessAddress vaddr, u64 expected_token) {
+    return impl->GrantCachedPageRead(GetInteger(vaddr), expected_token);
 }
 
 bool Memory::InvalidateNCE(Common::ProcessAddress vaddr, size_t size) {

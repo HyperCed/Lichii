@@ -43,6 +43,9 @@ constexpr u64 EcSystemRegister = 0x18;
 constexpr u64 EcInstructionAbort = 0x20;
 constexpr u64 EcDataAbort = 0x24;
 constexpr u64 EcBreakpoint = 0x3c;
+constexpr u64 FscMask = 0x3f;
+constexpr u64 FscTranslationFaultFirst = 0x04;
+constexpr u64 FscTranslationFaultLast = 0x07;
 
 // Trapped system registers, as the syndrome encodes them (op0, op2, op1, CRn, CRm).
 constexpr u64 SystemRegisterMask = 0x3ffc1e;
@@ -65,6 +68,11 @@ u64 GetReg(const Hvf::Vcpu& vcpu, hv_reg_t reg) {
 
 void SetReg(const Hvf::Vcpu& vcpu, hv_reg_t reg, u64 value) {
     Check(hv_vcpu_set_reg(vcpu.id, reg, value));
+}
+
+void RequestTlbFlush(Hvf::Vcpu& vcpu) {
+    vcpu.tlb_flush_pending.store(true, std::memory_order_release);
+    SetReg(vcpu, HV_REG_PC, Hvf::FlushStub);
 }
 
 u64 GetSys(const Hvf::Vcpu& vcpu, hv_sys_reg_t reg) {
@@ -414,19 +422,33 @@ HaltReason ArmHvf::RunThread(Kernel::KThread* thread) {
         stats_start = m_system.CoreTiming().GetClockTicks();
     }
     HaltReason hr{};
+    bool pending_flush{};
+    u64 pending_flush_generation{};
     while (true) {
         hr = static_cast<HaltReason>(m_halt.exchange(0));
         if (True(hr)) {
             break;
         }
         vcpu.in_guest.store(true);
-        if (const u64 generation = m_vm.TlbGeneration();
+        const u64 generation = m_vm.TlbGeneration();
+        if (vcpu.tlb_flush_pending.load(std::memory_order_acquire) ||
             generation != vcpu.seen_tlb_generation.load(std::memory_order_relaxed)) {
-            SetReg(vcpu, HV_REG_PC, Hvf::FlushStub);
-            vcpu.seen_tlb_generation.store(generation);
+            RequestTlbFlush(vcpu);
+            pending_flush_generation = generation;
+            pending_flush = true;
         }
         Check(hv_vcpu_run(vcpu.id));
         vcpu.in_guest.store(false);
+
+        if (pending_flush) {
+            const u64 pc = GetReg(vcpu, HV_REG_PC);
+            if (pc < Hvf::FlushStub || pc >= Hvf::FlushStub + 16) {
+                vcpu.seen_tlb_generation.store(pending_flush_generation,
+                                               std::memory_order_release);
+                vcpu.tlb_flush_pending.store(false, std::memory_order_release);
+                pending_flush = false;
+            }
+        }
 
         hr = HandleExit(vcpu);
         if (True(hr)) {
@@ -525,7 +547,7 @@ HaltReason ArmHvf::HandleVector(Hvf::Vcpu& vcpu, u64 vector) {
         const u64 address = GetSys(vcpu, HV_SYS_REG_FAR_EL1);
         if (m_space.Query(address, false) == Hvf::AddressSpace::Access::Allowed) {
             // The TLB held a translation older than the tables.
-            SetReg(vcpu, HV_REG_PC, Hvf::FlushStub);
+            RequestTlbFlush(vcpu);
             return {};
         }
         LOG_CRITICAL(Core_ARM, "Cannot execute instruction at unmapped address {:#016x}", address);
@@ -550,14 +572,25 @@ HaltReason ArmHvf::HandleDataAbort(Hvf::Vcpu& vcpu, u64 syndrome) {
 
     // Whatever let the access through may have added permissions to a cached translation.
     const auto retry = [&] {
-        SetReg(vcpu, HV_REG_PC, Hvf::FlushStub);
+        RequestTlbFlush(vcpu);
         return HaltReason{};
     };
 
     const Access access = m_space.Query(address, write);
     if (access == Access::Allowed) {
-        g_stats.Count(g_stats.stale_tlb);
-        return retry();
+        const u64 fault_status = syndrome & FscMask;
+        if (fault_status >= FscTranslationFaultFirst &&
+            fault_status <= FscTranslationFaultLast) {
+            g_stats.Count(g_stats.stale_tlb);
+            return retry();
+        }
+        if (InterpretAccess(vcpu, m_memory)) {
+            g_stats.Count(g_stats.interpreted);
+            m_fault_repeats = 0;
+            return {};
+        }
+        m_fault_repeats = 0;
+        return HaltReason::DataAbort;
     }
     g_stats.Count(write ? g_stats.write_fault : g_stats.read_fault);
 
@@ -614,9 +647,10 @@ HaltReason ArmHvf::HandleDataAbort(Hvf::Vcpu& vcpu, u64 syndrome) {
         if (!write) {
             // The slow read path brings the GPU's data and disarms a read trap, unless it finds
             // the data current already: the page is as readable then, and only its trap is left.
+            const u64 read_trap_token = m_memory.ReadTrapToken(address);
             (void)m_memory.Read8(address);
             if (m_space.Query(address, false) == Access::Allowed ||
-                m_memory.GrantCachedPageRead(address)) {
+                m_memory.GrantCachedPageRead(address, read_trap_token)) {
                 return retry();
             }
         }
@@ -633,7 +667,14 @@ HaltReason ArmHvf::HandleDataAbort(Hvf::Vcpu& vcpu, u64 syndrome) {
         return {};
     }
 
-    // Skip the instruction: this lets games continue where they would otherwise crash.
+    if (!Settings::values.cpuopt_ignore_memory_aborts.GetValue()) {
+        LOG_ERROR(Core_ARM, "Invalid {} of {:#016x} at pc {:#x}; stopping the guest",
+                  write ? "write" : "read", address, pc);
+        m_fault_repeats = 0;
+        return HaltReason::DataAbort;
+    }
+
+    // The configured ignore-aborts policy allows continuing past an unresolved access.
     static std::atomic<u64> skipped{};
     if (const u64 count = skipped.fetch_add(1); count < 100 || count % 100000 == 0) {
         // Why it was skipped: what the guest's tables, the emulator's page table and the kernel

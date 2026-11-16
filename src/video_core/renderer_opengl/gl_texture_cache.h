@@ -6,6 +6,7 @@
 #pragma once
 
 #include <memory>
+#include <source_location>
 #include <span>
 
 #include <glad/glad.h>
@@ -101,7 +102,9 @@ public:
         return true;
     }
 
-    void CopyImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
+    void CopyImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies,
+                   [[maybe_unused]] std::source_location location =
+                       std::source_location::current());
 
     void CopyImageMSAA(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
 

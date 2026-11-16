@@ -575,7 +575,8 @@ u64 TextureCacheRuntime::GetDeviceMemoryUsage() const {
 }
 
 void TextureCacheRuntime::CopyImage(Image& dst_image, Image& src_image,
-                                    std::span<const ImageCopy> copies) {
+                                    std::span<const ImageCopy> copies,
+                                    [[maybe_unused]] std::source_location location) {
     const GLuint dst_name = dst_image.Handle();
     const GLuint src_name = src_image.Handle();
     const GLenum dst_target = ImageTarget(dst_image.info);

@@ -27,6 +27,10 @@ public:
     explicit MasterSemaphore(const Device& device);
     ~MasterSemaphore();
 
+    [[nodiscard]] VkSemaphore GetSemaphore() const noexcept {
+        return *semaphore;
+    }
+
     /// Returns the current logical tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
         return current_tick.load(std::memory_order_acquire);

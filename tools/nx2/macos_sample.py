@@ -126,9 +126,9 @@ def main():
         if total * 20 < longest:
             continue
         idle = sum(count for leaf, count in leaves.items() if leaf in IDLE)
-        # Unsymbolized frames are the guest's code on the core threads only.
+        cpu_thread = name.startswith(("CPUCore", "CPUThread"))
         guest = sum(count for leaf, count in leaves.items()
-                    if leaf in GUEST) if name.startswith("CPUCore") else 0
+                    if leaf in GUEST) if cpu_thread else 0
         rows.append((100.0 * (total - idle) / total, 100.0 * guest / total, name, total, leaves,
                      waits))
     rows.sort(key=lambda row: -row[0])
@@ -138,8 +138,9 @@ def main():
         if busy < 1.0:
             continue
         print(f"{busy:5.1f}% {guest:5.1f}%  {name}")
+        show_guest_functions = name.startswith("CPUThread")
         work = [(count, leaf) for leaf, count in leaves.items()
-                if leaf not in IDLE and leaf not in GUEST]
+                if leaf not in IDLE and (leaf not in GUEST or show_guest_functions)]
         for count, leaf in sorted(work, reverse=True)[:args.top]:
             print(f"{'':16}{100.0 * count / total:5.1f}%  {leaf[:100]}")
         for waiter, count in waits.most_common(args.waits):

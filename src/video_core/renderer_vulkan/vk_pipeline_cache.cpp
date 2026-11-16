@@ -2761,19 +2761,30 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 continue;
             }
             if (program.stage == Shader::Stage::Task) {
-                mesh_unsupported = program.shared_memory_size > limits.maxTaskSharedMemorySize ||
-                                   program.mesh.payload_words * 4 > limits.maxTaskPayloadSize;
+                const u64 payload_bytes = u64{program.mesh.payload_words} * sizeof(u32);
+                mesh_unsupported =
+                    program.shared_memory_size > limits.maxTaskSharedMemorySize ||
+                    payload_bytes > limits.maxTaskPayloadSize ||
+                    payload_bytes + program.shared_memory_size >
+                        limits.maxTaskPayloadAndSharedMemorySize;
             } else if (program.stage == Shader::Stage::Mesh) {
                 constexpr u64 LineBytes = 16;
                 const u64 outputs{program.mesh.max_vertices * program.mesh.vertex_lines.size() *
                                       LineBytes +
                                   program.mesh.max_primitives *
                                       program.mesh.primitive_lines.size() * LineBytes};
+                const bool has_task{key.unique_hashes[1] != 0 &&
+                                    programs[1].stage == Shader::Stage::Task};
+                const u64 payload_bytes =
+                    has_task ? u64{programs[1].mesh.payload_words} * sizeof(u32) : 0;
                 mesh_unsupported =
                     program.mesh.max_vertices > limits.maxMeshOutputVertices ||
                     program.mesh.max_primitives > limits.maxMeshOutputPrimitives ||
-                    program.shared_memory_size + outputs >
-                        u64{limits.maxMeshSharedMemorySize} + limits.maxMeshOutputMemorySize;
+                    program.shared_memory_size > limits.maxMeshSharedMemorySize ||
+                    outputs > limits.maxMeshOutputMemorySize ||
+                    payload_bytes + program.shared_memory_size >
+                        limits.maxMeshPayloadAndSharedMemorySize ||
+                    payload_bytes + outputs > limits.maxMeshPayloadAndOutputMemorySize;
             }
             if (mesh_unsupported) {
                 LOG_INFO(Render_Vulkan,
@@ -2828,6 +2839,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         if (!eligible) {
             return nullptr;
+        }
+        const u32 max_compute_shared_memory = device.GetMaxComputeSharedMemorySize();
+        for (size_t index = 1; index < Maxwell::MaxShaderProgram; ++index) {
+            const bool emulated{index == mesh_index || (has_task && index == 1)};
+            if (emulated && programs[index].shared_memory_size > max_compute_shared_memory) {
+                LOG_WARNING(Render_Vulkan,
+                            "Pipeline {:016x}: skipping mesh emulation because program {:016x} "
+                            "needs {} B of compute shared memory, but the device supports {} B",
+                            hash, key.unique_hashes[index], programs[index].shared_memory_size,
+                            max_compute_shared_memory);
+                return nullptr;
+            }
         }
         // Per-primitive outputs reach the pixel program flat through the vertex shader. A vertex
         // shader writes Layer and ViewportIndex only with VK_EXT_shader_viewport_index_layer, and

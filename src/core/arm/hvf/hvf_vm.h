@@ -37,6 +37,7 @@ struct Vcpu {
     /// Set around hv_vcpu_run, with TLB shootdowns in mind.
     std::atomic<bool> in_guest{};
     std::atomic<u64> seen_tlb_generation{};
+    std::atomic<bool> tlb_flush_pending{};
     /// The interface whose guest context the vCPU's registers hold.
     std::atomic<ArmHvf*> owner{};
 };

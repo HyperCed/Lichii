@@ -515,9 +515,13 @@ public:
 
     bool InvalidateNCE(Common::ProcessAddress vaddr, size_t size);
 
+    /// Returns the active read-trap token for a page, or zero when it has no trap. Capture it
+    /// before a slow-path read and pass it to GrantCachedPageRead.
+    u64 ReadTrapToken(Common::ProcessAddress vaddr);
+
     /// Makes a page the GPU caches readable once a slow-path read has brought its data, read
     /// trap or not. False when the GPU doesn't cache the page.
-    bool GrantCachedPageRead(Common::ProcessAddress vaddr);
+    bool GrantCachedPageRead(Common::ProcessAddress vaddr, u64 expected_token);
 
     bool InvalidateSeparateHeap(void* fault_address);
 

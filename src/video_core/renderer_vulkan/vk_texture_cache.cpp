@@ -325,13 +325,18 @@ enum class SparseTilesMode {
 // under it can hold data: unbacked at first, then Image::BindTiles. Formats of one texel per
 // block that the host samples as they are.
 [[nodiscard]] bool UsesSparseTiles(const Device& device, const ImageInfo& info, GPUVAddr gpu_addr) {
-    if (SparseTilesModeOf(device) == SparseTilesMode::None || info.type != ImageType::e2D ||
+    const SparseTilesMode sparse_mode = SparseTilesModeOf(device);
+    if (sparse_mode == SparseTilesMode::None || info.type != ImageType::e2D ||
         info.num_samples != 1 || info.size.depth != 1 || info.block.width != 0 ||
         VideoCore::Surface::GetFormatType(info.format) != VideoCore::Surface::SurfaceType::ColorTexture) {
         return false;
     }
     const bool texel_blocks = VideoCore::Surface::DefaultBlockWidth(info.format) != 1 ||
                               VideoCore::Surface::DefaultBlockHeight(info.format) != 1;
+    if (sparse_mode == SparseTilesMode::Aliased && texel_blocks) {
+        // Aliased images are initialized with vkCmdClearColorImage, which rejects compressed formats.
+        return false;
+    }
     if (info.resources.layers != 1 || texel_blocks) {
         // Compressed formats only where the host samples them as they are.
         const bool as_is = !texel_blocks ||
@@ -4011,6 +4016,23 @@ void Image::ReleaseTilesOutside(std::span<const VideoCommon::LevelRect> keep) {
     if (image_binds.empty()) {
         return;
     }
+    const u64 tick = scheduler->Flush();
+    // The signal must be submitted before this same-queue sparse bind waits on it.
+    scheduler->WaitWorker();
+    MasterSemaphore& master_semaphore = scheduler->GetMasterSemaphore();
+    const VkSemaphore timeline_semaphore = master_semaphore.GetSemaphore();
+    const bool has_timeline_semaphore = timeline_semaphore != VK_NULL_HANDLE;
+    if (!has_timeline_semaphore) {
+        master_semaphore.Wait(tick);
+    }
+    const VkTimelineSemaphoreSubmitInfo timeline_info{
+        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+        .pNext = nullptr,
+        .waitSemaphoreValueCount = has_timeline_semaphore ? 1U : 0U,
+        .pWaitSemaphoreValues = has_timeline_semaphore ? &tick : nullptr,
+        .signalSemaphoreValueCount = 0,
+        .pSignalSemaphoreValues = nullptr,
+    };
     const VkSparseImageMemoryBindInfo image_bind_info{
         .image = *original_image,
         .bindCount = static_cast<u32>(image_binds.size()),
@@ -4018,9 +4040,9 @@ void Image::ReleaseTilesOutside(std::span<const VideoCommon::LevelRect> keep) {
     };
     const VkBindSparseInfo bind_info{
         .sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO,
-        .pNext = nullptr,
-        .waitSemaphoreCount = 0,
-        .pWaitSemaphores = nullptr,
+        .pNext = has_timeline_semaphore ? &timeline_info : nullptr,
+        .waitSemaphoreCount = has_timeline_semaphore ? 1U : 0U,
+        .pWaitSemaphores = has_timeline_semaphore ? &timeline_semaphore : nullptr,
         .bufferBindCount = 0,
         .pBufferBinds = nullptr,
         .imageOpaqueBindCount = 0,

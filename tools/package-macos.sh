@@ -7,6 +7,8 @@
 # Qt and the Homebrew libraries go inside the bundle, so it runs on a Mac without them.
 # usage: tools/package-macos.sh [build dir (build/release)] [output dir (build/package)]
 
+set -o pipefail
+
 cd "$(dirname "$0")/.."
 build=${1:-build/release}
 out=${2:-build/package}
@@ -29,25 +31,74 @@ rm -f "$app/Contents/PlugIns/platforminputcontexts/libqtvirtualkeyboardplugin.dy
 # it can't find. The emulator uses none of them: a plugin with a dependency missing from the
 # bundle is dropped rather than left to fail on another Mac.
 unresolved() {
-    otool -L "$1" | awk '/@rpath\//{print $1}' | while read -r name; do
-        [ -e "$app/Contents/Frameworks/${name#@rpath/}" ] || echo "$name"
-    done
+    local dependencies line name
+    if ! dependencies=$(otool -L "$1"); then
+        echo "Failed to inspect dependencies for $1" >&2
+        return 1
+    fi
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]+(@rpath/[^[:space:]]+) ]]; then
+            name=${BASH_REMATCH[1]}
+            if [ ! -e "$app/Contents/Frameworks/${name#@rpath/}" ]; then
+                printf '%s\n' "$name"
+            fi
+        fi
+    done <<< "$dependencies"
 }
-find "$app/Contents/PlugIns" -name '*.dylib' | while read -r plugin; do
-    if [ -n "$(unresolved "$plugin")" ]; then
-        echo "Dropping ${plugin#"$app"/}: needs $(unresolved "$plugin" | tr '\n' ' ')"
+
+candidate_file=$(mktemp)
+trap 'rm -f "$candidate_file"' EXIT
+if ! find "$app/Contents/PlugIns" -name '*.dylib' -print0 > "$candidate_file"; then
+    echo "Failed to list app plugins" >&2
+    exit 1
+fi
+while IFS= read -r -d '' plugin; do
+    if ! missing=$(unresolved "$plugin"); then
+        exit 1
+    fi
+    if [ -n "$missing" ]; then
+        echo "Dropping ${plugin#"$app"/}: needs ${missing//$'\n'/ }"
         rm -f "$plugin"
     fi
-done
+done < "$candidate_file"
 
-binaries=$(find "$app/Contents" -type f \( -perm -u+x -o -name '*.dylib' \) \
-    -exec sh -c 'file -b "$1" | grep -q Mach-O' _ {} \; -print)
-for binary in $binaries; do
-    otool -l "$binary" | awk '/cmd LC_RPATH/ {getline; getline; print $2}' |
-        { grep -E -e '^/(opt/homebrew|usr/local)/' -e "^$PWD/" || true; } |
-        while read -r rpath; do
-            install_name_tool -delete_rpath "$rpath" "$binary" 2> /dev/null
-        done
+if ! find "$app/Contents" -type f \( -perm -u+x -o -name '*.dylib' \) -print0 \
+    > "$candidate_file"; then
+    echo "Failed to list app binaries" >&2
+    exit 1
+fi
+binaries=()
+while IFS= read -r -d '' candidate; do
+    if ! description=$(file -b "$candidate"); then
+        echo "Failed to identify binary type for $candidate" >&2
+        exit 1
+    fi
+    case "$description" in
+        *Mach-O*) binaries+=("$candidate") ;;
+    esac
+done < "$candidate_file"
+
+remove_nonbundle_rpaths() {
+    local binary="$1" load_commands rpaths rpath
+    if ! load_commands=$(otool -l "$binary"); then
+        echo "Failed to inspect rpaths for $binary" >&2
+        return 1
+    fi
+    if ! rpaths=$(awk '/cmd LC_RPATH/ {getline; getline; print $2}' <<< "$load_commands"); then
+        echo "Failed to parse rpaths for $binary" >&2
+        return 1
+    fi
+    while IFS= read -r rpath; do
+        case "$rpath" in
+            /opt/homebrew/* | /usr/local/* | "$PWD"/*)
+                install_name_tool -delete_rpath "$rpath" "$binary" 2>/dev/null || return 1
+                ;;
+        esac
+    done <<< "$rpaths"
+}
+
+for binary in "${binaries[@]}"; do
+    remove_nonbundle_rpaths "$binary"
 done
 # Libraries that load their dependencies through @rpath find them in the bundle.
 for program in lichii eden-cli; do
@@ -61,17 +112,57 @@ codesign --force --sign - --entitlements dist/eglantine.entitlements "$app/Conte
 codesign --force --sign - --entitlements dist/eglantine.entitlements "$app"
 codesign --verify --deep --strict "$app"
 
-leaks=$(for binary in $binaries; do
-    otool -L "$binary" | grep -E -e '^\s+/(opt/homebrew|usr/local)/' -e "^\s+$PWD/"
-    otool -l "$binary" | awk '/cmd LC_RPATH/ {getline; getline; print $2}' |
-        grep -E -e '^/(opt/homebrew|usr/local)/' -e "^$PWD/"
-    unresolved "$binary"
-done || true)
-if [ -n "$leaks" ]; then
-    echo "References still pointing outside the bundle, or missing from it:"
-    echo "$leaks" | sort -u
-    exit 1
-fi
+inspect_binary() {
+    local binary="$1" dependencies load_commands rpaths rpath missing line first
+    if ! dependencies=$(otool -L "$binary"); then
+        echo "Failed to inspect linked libraries for $binary" >&2
+        return 1
+    fi
+    first=1
+    while IFS= read -r line; do
+        if [ "$first" -eq 1 ]; then
+            first=0
+            continue
+        fi
+        case "$line" in
+            *"/usr/lib/libhvf.dylib"*)
+                echo "::error::$binary links /usr/lib/libhvf.dylib, unavailable on macOS 15.0 to 15.3" >&2
+                return 1
+                ;;
+            *"/opt/homebrew/"* | *"/usr/local/"* | *"$PWD/"*)
+                echo "Reference outside the app bundle in $binary: $line" >&2
+                return 1
+                ;;
+        esac
+    done <<< "$dependencies"
+    if ! load_commands=$(otool -l "$binary"); then
+        echo "Failed to inspect load commands for $binary" >&2
+        return 1
+    fi
+    if ! rpaths=$(awk '/cmd LC_RPATH/ {getline; getline; print $2}' <<< "$load_commands"); then
+        echo "Failed to parse rpaths for $binary" >&2
+        return 1
+    fi
+    while IFS= read -r rpath; do
+        case "$rpath" in
+            /opt/homebrew/* | /usr/local/* | "$PWD"/*)
+                echo "Rpath outside the app bundle in $binary: $rpath" >&2
+                return 1
+                ;;
+        esac
+    done <<< "$rpaths"
+    if ! missing=$(unresolved "$binary"); then
+        return 1
+    fi
+    if [ -n "$missing" ]; then
+        echo "Dependencies missing from the app bundle for $binary: ${missing//$'\n'/ }" >&2
+        return 1
+    fi
+}
+
+for binary in "${binaries[@]}"; do
+    inspect_binary "$binary"
+done
 
 ditto -c -k --keepParent "$app" "$out/lichii-macos-arm64.zip"
 echo "Packaged $app and $out/lichii-macos-arm64.zip"
