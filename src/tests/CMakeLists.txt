@@ -63,6 +63,7 @@ add_executable(tests
     audio_core/hardware_audio_codec.cpp
     core/gpu_dirty_memory.cpp
     core/nso_loader.cpp
+    core/nsp_loader.cpp
     core/memory_acquire.cpp
     core/kip_sections.cpp
     core/memory_span.cpp
