@@ -36,6 +36,8 @@
 #include "common/literals.h"
 #include "common/logging.h"
 #include "common/memory_detect.h"
+#include "common/nextendo.h"
+#include "common/npln_patch_catalog.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/string_util.h"
@@ -47,6 +49,8 @@
 #include "core/file_sys/nup_writer.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/vfs/vfs_real.h"
+#include "core/hle/service/acc/nextendo_id_token.h"
+#include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
@@ -702,6 +706,19 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         load_parameters.previous_program_index = handoff->previous_program_index;
         LOG_INFO(Frontend, "Restarted by the game: program index {}, {} user channel entries",
                  handoff->program_index, state->system.GetUserChannel().size());
+    }
+    // SdlState read the profiles before the config named the NAND.
+    state->system.GetProfileManager().ResetUserSaveFile();
+    Common::Nextendo::MigrateAccountFile(Service::Account::Nextendo::CurrentProfile(state->system));
+    if (Common::Nextendo::OnlinePlayActive()) {
+        const auto loader = Loader::GetLoader(
+            state->system, Core::GetGameFileFromPath(state->system.GetFilesystem(), lp.filepath),
+            load_parameters.program_id, load_parameters.program_index);
+        u64 title_id{};
+        if (loader && loader->ReadProgramId(title_id) == Loader::ResultStatus::Success) {
+            Common::NplnPatchCatalog::PrepareForGame(
+                title_id, [&] { return loader->ReadMainBuildIdHex(state->system); });
+        }
     }
     const Core::SystemResultStatus load_result = state->system.Load(*state->emu_window, lp.filepath, load_parameters);
     switch (load_result) {

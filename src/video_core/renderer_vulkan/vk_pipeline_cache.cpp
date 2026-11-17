@@ -72,6 +72,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_cache_v2.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_cache_v2/cache_file.h"
@@ -470,7 +471,7 @@ vk::ShaderModule EmitComputeModule(const Device& device, const Shader::Profile& 
     kept_spirv = Common::Compression::CompressDataZSTD(reinterpret_cast<const u8*>(code.data()),
                                                        code.size() * sizeof(u32), 1);
     device.SaveShader(code);
-    vk::ShaderModule spv_module{BuildShader(device, code)};
+    vk::ShaderModule spv_module{BuildGuestShader(device, code, shader_hash)};
 
     // Text log + .spv dump. Same split as the graphics path.
     const bool should_log = GPU::Logging::IsActive();
@@ -486,11 +487,6 @@ vk::ShaderModule EmitComputeModule(const Device& device, const Shader::Profile& 
             GPU::Logging::DumpSpirvShader(shader_hash,
                                           std::span<const u32>(code.data(), code.size()));
         }
-    }
-
-    if (device.HasDebuggingToolAttached()) {
-        const auto name{fmt::format("Shader {:016x}", shader_hash)};
-        spv_module.SetObjectNameEXT(name.c_str());
     }
     return spv_module;
 }
@@ -1021,7 +1017,26 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         current_pipeline = nullptr;
         return nullptr;
     }
+    const bool mesh_draw =
+        maxwell3d->GetNativeMacroEngine().native_turing && maxwell3d->regs.IsMeshEnabled();
+    if (vertex_input_lent && !mesh_draw) {
+        // Refresh keeps the key's vertex input until the registers change it.
+        vertex_input_lent = false;
+        maxwell3d->dirty.flags[Dirty::VertexInput] = true;
+    }
     graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+    if (mesh_draw) {
+        // Before the transitions, which hold the lender's key
+        if (!mesh_vertex_inputs_seeded) {
+            mesh_vertex_inputs_seeded = true;
+            for (const auto& [key, pipeline] : graphics_cache) {
+                if (pipeline && pipeline->IsMeshPipeline()) {
+                    mesh_vertex_inputs.Add(key);
+                }
+            }
+        }
+        vertex_input_lent |= mesh_vertex_inputs.Lend(graphics_key);
+    }
 
     if (current_pipeline) {
         GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};
@@ -1807,8 +1822,9 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
             },
             job);
     };
-    // With the precache, the prebuild starts after it, as its jobs would queue ahead of the
-    // precache's. The older sessions' pipelines come first.
+    // See PrebuildStartsWithBootBuilds. The older sessions' pipelines come first.
+    const bool prebuild_with_boot = PrebuildStartsWithBootBuilds(
+        precache, use_vulkan_pipeline_cache && !device.CanReadPipelineCacheDuringBuilds());
     const size_t deferred_pipelines = prebuild.size();
     std::vector<VideoCommon::ShaderJobHandle> older_jobs;
     const auto start_prebuild = [&] {
@@ -1850,7 +1866,7 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - load_begin)
                      .count());
     };
-    if (!precache) {
+    if (prebuild_with_boot) {
         start_prebuild();
     }
 
@@ -1867,7 +1883,7 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
         state.has_loaded = true;
     }
     boot.Wait();
-    if (!precache) {
+    if (prebuild_with_boot) {
         await_older();
     }
     {
@@ -1917,13 +1933,9 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
     records.clear();
     log.reset();
 
-    // Skip the intermediate save where reading the driver cache during a build crashes (see
-    // Device::CanReadPipelineCacheDuringBuilds): without a precache the background prebuild can
-    // already be building into the cache here, and nothing joins its builds before this read; a
-    // stopped load can leave a cancelled prebuild build running past the same point. The
-    // session-end save in ~PipelineCache stays ordered after the build workers shut down and
-    // still covers persistence.
-    if (use_vulkan_pipeline_cache && device.CanReadPipelineCacheDuringBuilds()) {
+    // The boot builds have all ended (boot.Wait), and where reading the driver cache during a
+    // build crashes the prebuild has not started yet (see PrebuildStartsWithBootBuilds).
+    if (use_vulkan_pipeline_cache) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION);
         size_t size = 0;
@@ -1958,7 +1970,7 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
         scheduled_prebuild.reset();
         return;
     }
-    if (precache) {
+    if (!prebuild_with_boot) {
         start_prebuild();
         await_older();
     }
@@ -2191,13 +2203,10 @@ void PipelineCache::QueueVulkanPipelineCacheFlush() {
 }
 
 void PipelineCache::QueueVulkanPipelineCacheSave() {
-    if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty() ||
-        !device.CanReadPipelineCacheDuringBuilds()) {
+    if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
         return;
     }
-    // Not skipped when a timed flush is in flight: that one may have read the cache before the
-    // stage's last builds. The serialization thread runs the two one after the other.
-    serialization_thread.QueueWork([this] {
+    const auto save = [this] {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION);
         size_t size = 0;
@@ -2205,7 +2214,16 @@ void PipelineCache::QueueVulkanPipelineCacheSave() {
         last_cache_size.store(size, std::memory_order_relaxed);
         LOG_INFO(Render_Vulkan, "Driver pipeline cache saved after the shader precache, {} bytes",
                  size);
-    });
+    };
+    // Here the precache's builds have ended and the prebuild has not started (see
+    // PrebuildStartsWithBootBuilds), so no build runs while this thread reads the cache.
+    if (!device.CanReadPipelineCacheDuringBuilds()) {
+        save();
+        return;
+    }
+    // Not skipped when a timed flush is in flight: that one may have read the cache before the
+    // stage's last builds. The serialization thread runs the two one after the other.
+    serialization_thread.QueueWork(save);
 }
 
 namespace {

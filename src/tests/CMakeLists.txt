@@ -12,6 +12,9 @@ add_executable(tests
     video_core/block_linear_swizzle.cpp
     video_core/aftermath_dump.cpp
     video_core/frame_dump_schedule.cpp
+    video_core/frame_dump_decode.cpp
+    video_core/frame_gen_generations.cpp
+    video_core/frame_pacer.cpp
     video_core/nx2_stutter_trace.cpp
     video_core/back_idle_trace.cpp
     video_core/list_macro_trace.cpp
@@ -21,6 +24,7 @@ add_executable(tests
     video_core/hdr_output.cpp
     core/mii_model.cpp
     core/nx2_streamplay.cpp
+    core/nx2_gpu_only_regions.cpp
     core/nx2_video_ready.cpp
     core/general_channel.cpp
     core/kernel_finish_termination.cpp
@@ -34,7 +38,11 @@ add_executable(tests
     core/perf_stats.cpp
     core/service_auto_stub.cpp
     core/key_derivation.cpp
+    core/eticket_title_key.cpp
+    core/keyblob_cmac.cpp
+    core/aes_xts.cpp
     common/display_hdr.cpp
+    common/restore_eden_path.cpp
     common/dkb_cpu_trace.cpp
     common/dkb_frame_trace.cpp
     audio_core/nx2_sysmix.cpp
@@ -45,8 +53,10 @@ add_executable(tests
     video_core/ampere_starfox_test10.cpp
     video_core/ampere_yoshi_title.cpp
     video_core/ampere_yoshi_compute.cpp
+    video_core/scaled_image_fits.cpp
     video_core/texture_rect_descriptor.cpp
     video_core/join_whole_copy.cpp
+    video_core/padded_square.cpp
     audio_core/batch_decoder.cpp
     audio_core/adpcm_decode.cpp
     audio_core/microphone.cpp
@@ -71,13 +81,16 @@ add_executable(tests
     video_core/storage_write_extent.cpp
     video_core/storage_buffer_control_flow.cpp
     video_core/conditional_barrier.cpp
+    video_core/far_plane_position.cpp
     video_core/storage_buffer_shared_tracking.cpp
     core/nup_validation.cpp
+    core/fs_read_throttle.cpp
     core/npdm_kac.cpp
     core/nx_archive.cpp
     frontend_common/nx_archive.cpp
     core/vfs_vector.cpp
     core/kip_ini.cpp
+    core/add_on_application_id.cpp
     core/ncz_cache.cpp
     core/kip_truncated.cpp
     core/ncz_decompressor.cpp
@@ -101,6 +114,7 @@ add_executable(tests
     video_core/framebuffer_clear_layers.cpp
     video_core/framebuffer_limits.cpp
     video_core/descriptor_limits.cpp
+    video_core/device_memory_asid.cpp
     video_core/unbacked_fallback.cpp
     video_core/eviction_age.cpp
     video_core/host_memory_limit.cpp
@@ -123,6 +137,7 @@ add_executable(tests
     video_core/spirv_storage_alignment.cpp
     video_core/spirv_fragment_shuffle.cpp
     video_core/mesh_fallback.cpp
+    video_core/mesh_vertex_input.cpp
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
     video_core/gpu_trace.cpp
@@ -137,6 +152,7 @@ add_executable(tests
     video_core/maxwell_fast_method.cpp
     hid_core/emulated_controller_config.cpp
     hid_core/sensor_info.cpp
+    common/flat_allocator.cpp
     common/paged_scalar.cpp
     common/queue_lifetime.cpp
     common/queue_timed_wait.cpp
@@ -168,10 +184,12 @@ add_executable(tests
     video_core/fast_draw.cpp
     video_core/gpu_command_safety.cpp
     video_core/syncpoint_actions.cpp
+    video_core/due_composites.cpp
     video_core/nx2_video_av1.cpp
     video_core/nx2_video_render.cpp
     video_core/ampere_matrix.cpp
     video_core/spirv_software_matrix.cpp
+    video_core/spirv_program_name.cpp
     video_core/spirv_builtin_capabilities.cpp
     video_core/spirv_min_max_denorms.cpp
     video_core/spirv_nan_safe_min_max.cpp
@@ -200,6 +218,7 @@ add_executable(tests
     common/memory_detect.cpp
     common/multi_level_page_table.cpp
     common/nextendo.cpp
+    common/npln_patch_manifest.cpp
     common/page_table.cpp
     common/param_package.cpp
     common/poll_window.cpp
@@ -229,8 +248,12 @@ add_executable(tests
     core/internal_network/socket_proxy.cpp
     core/priority_queue.cpp
     core/internal_network/network.cpp
+    core/bsd_sockopt_ipc.cpp
+    core/bsd_ipv6_ipc.cpp
+    core/ipv6_sockets.cpp
     core/numeric_name_info.cpp
     core/numeric_name_info_ipc.cpp
+    core/nifm_request.cpp
     core/cmif_out_buffer.cpp
     core/time_zone_fallback.cpp
     video_core/memory_tracker.cpp
@@ -277,6 +300,7 @@ create_target_directory_groups(tests)
 
 target_link_libraries(tests PRIVATE common core audio_core input_common video_core frontend_common tz ZLIB::ZLIB)
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
+target_link_libraries(tests PRIVATE nlohmann_json::nlohmann_json OpenSSL::Crypto)
 
 add_executable(ncz_tests
     core/ncz_cache.cpp

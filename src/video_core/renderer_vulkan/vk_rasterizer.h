@@ -210,6 +210,8 @@ private:
     void CaptureIndirectTrace();
     void CollectIndirectTrace();
     void TraceDrawFailure(std::string_view reason);
+    /// Remembers render target 0 of a draw that can hold Ocarina of Time's tonemapped image.
+    void TrackOotTonemappedImage();
     bool TryNx2IndirectReset(bool is_indexed, u32 instance_count);
 
     void FlushWork();
@@ -544,6 +546,10 @@ private:
     /// EDEN_NX2_FAST_DRAW_VERIFY: this draw passed DeltaStillHolds, so UpdateVertexInput compares
     /// the vertex input recorded last with what the registers give now.
     bool verify_vertex_input{};
+    /// The draw's pipeline puts every vertex on the far plane and the game set no polygon offset
+    /// for it: it gets a depth bias towards the far value and depth clamping (see
+    /// UpdateDynamicStates).
+    bool far_plane_draw{};
     VertexInputState recorded_vertex_input;
     bool vertex_input_recorded{};
 

@@ -8,7 +8,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+// Before the Vulkan headers: Xlib defines Success, which NvResult (nvdata.h) declares.
+#include "video_core/renderer_vulkan/vk_state_tracker.h"
+
 #include "common/common_types.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_instance.h"
 #include "video_core/vulkan_common/vulkan_library.h"
@@ -112,4 +117,74 @@ TEST_CASE("Vulkan buffers: aligned CreateBuffer keeps its alignment on the share
         REQUIRE(buffers.back());
         CHECK(buffers.back().Location().offset % alignment == 0);
     }
+}
+
+// #262 again: a guest buffer the buffer cache had no memory for after a scene change.
+TEST_CASE("Vulkan buffers: CreateAfterRecovery retries once after freeing memory",
+          "[vulkan_buffer_oom]") {
+    int creates = 0;
+    int recoveries = 0;
+    const auto recover = [&] { ++recoveries; };
+
+    SECTION("a create that succeeds recovers nothing") {
+        REQUIRE(Vulkan::CreateAfterRecovery([&] { return ++creates; }, recover) == 1);
+        REQUIRE(recoveries == 0);
+    }
+    SECTION("out of memory once: recovered, then created") {
+        const int result = Vulkan::CreateAfterRecovery(
+            [&] {
+                if (++creates == 1) {
+                    throw Vulkan::vk::Exception(VK_ERROR_OUT_OF_DEVICE_MEMORY);
+                }
+                return creates;
+            },
+            recover);
+        REQUIRE(result == 2);
+        REQUIRE(recoveries == 1);
+    }
+    SECTION("out of memory twice: the second failure throws") {
+        REQUIRE_THROWS_AS(Vulkan::CreateAfterRecovery(
+                              [&]() -> int {
+                                  ++creates;
+                                  throw Vulkan::vk::Exception(VK_ERROR_OUT_OF_HOST_MEMORY);
+                              },
+                              recover),
+                          Vulkan::vk::Exception);
+        REQUIRE(creates == 2);
+        REQUIRE(recoveries == 1);
+    }
+    SECTION("another error is not retried") {
+        REQUIRE_THROWS_AS(Vulkan::CreateAfterRecovery(
+                              [&]() -> int {
+                                  ++creates;
+                                  throw Vulkan::vk::Exception(VK_ERROR_DEVICE_LOST);
+                              },
+                              recover),
+                          Vulkan::vk::Exception);
+        REQUIRE(creates == 1);
+        REQUIRE(recoveries == 0);
+    }
+}
+
+// #1993: the recovery runs while a draw is set up, after its index and vertex binds were
+// recorded. A submit there left those binds in the submitted command buffer.
+TEST_CASE("Vulkan buffers: staging memory recovery does not submit the open command buffer",
+          "[vulkan_buffer_oom]") {
+    TestDevice test;
+    Vulkan::MemoryAllocator allocator(*test.device);
+    Vulkan::StateTracker state_tracker;
+    Vulkan::Scheduler scheduler(*test.device, state_tracker);
+    Vulkan::StagingBufferPool pool(*test.device, allocator, scheduler);
+
+    constexpr size_t size = 1 << 20;
+    const Vulkan::StagingBufferRef in_use = pool.Request(size, Vulkan::MemoryUsage::Download);
+    REQUIRE(in_use.buffer != VK_NULL_HANDLE);
+    const u64 tick = scheduler.CurrentTick();
+    const u64 epoch = scheduler.RecordingEpoch();
+
+    pool.ReleaseMemory();
+
+    CHECK(scheduler.CurrentTick() == tick);
+    CHECK(scheduler.RecordingEpoch() == epoch);
+    CHECK(pool.CachedBytes(Vulkan::MemoryUsage::Download) == size);
 }

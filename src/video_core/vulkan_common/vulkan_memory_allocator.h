@@ -213,6 +213,21 @@ namespace Vulkan {
         mutable std::unordered_map<u64, u32> buffer_memory_types;
     };
 
+    /// create(), and once more after recover() when it threw for lack of memory.
+    template <typename Create, typename Recover>
+    auto CreateAfterRecovery(Create&& create, Recover&& recover) {
+        try {
+            return create();
+        } catch (const vk::Exception& exception) {
+            if (exception.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+                exception.GetResult() != VK_ERROR_OUT_OF_HOST_MEMORY) {
+                throw;
+            }
+            recover();
+        }
+        return create();
+    }
+
     /// Logs VMA's blocks and allocations per memory type, and each heap's budget.
     void LogMemoryStatistics(const Device& device);
 

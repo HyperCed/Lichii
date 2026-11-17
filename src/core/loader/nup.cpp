@@ -342,4 +342,12 @@ ResultStatus AppLoader_NUP::ReadNSOModules(Modules& modules) {
     return secondary_loader->ReadNSOModules(modules);
 }
 
+ResultStatus AppLoader_NUP::ReadMainBuildId(Core::System& system,
+                                            std::array<u8, 0x20>& build_id) {
+    if (secondary_loader == nullptr) {
+        return ResultStatus::ErrorNotInitialized;
+    }
+    return secondary_loader->ReadMainBuildId(system, build_id);
+}
+
 } // namespace Loader

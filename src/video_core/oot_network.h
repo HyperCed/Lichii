@@ -5,9 +5,11 @@
 
 #include <array>
 #include <atomic>
+#include <mutex>
 
 #include "common/common_types.h"
 #include "common/settings.h"
+#include "video_core/engines/maxwell_3d.h"
 
 // The Legend of Zelda: Ocarina of Time's anti-aliasing. After tonemapping, the game runs a
 // single-frame tensor network on the tonemapped image and an output pass that sharpens the result
@@ -43,22 +45,41 @@ constexpr std::array BaseOutputPrograms{
     BaseOutputProgram{0x00017919, 0x6250, 0x58bdd5733e364169ULL},
 };
 
-/// Constant buffer 0 offset of the output pass's texture handle for the tonemapped image it
-/// samples (the network's input).
+/// Constant buffer 0 offset of the output pass's texture handle for the image it samples. On the
+/// update this is the HDR scene the tonemap pass reads, not the tonemapped image.
 constexpr u32 InputImageHandleOffset = 0xc0;
 
 /// Constant buffer 0 offset of the output pass's texture handle for the B10G11R11 image it writes
 /// (the scene image the rest of the frame uses).
 constexpr u32 OutputImageHandleOffset = 0xd0;
 
-/// Owned by the rasterizer: the network's passes do not all run on the same compute engine.
+/// Owned by the rasterizer: the tonemap pass draws on the 3D engine, and the network's passes do
+/// not all run on the same compute engine.
 struct BypassState {
+    std::mutex mutex;
+    /// Render target 0 of the latest draw IsTonemapCandidate accepted since the last output pass,
+    /// under mutex. Valid while latest_address is not 0.
+    Tegra::Engines::Maxwell3D::Regs::RenderTargetConfig latest_draw{};
+    std::atomic<u64> latest_address{};
+    /// The input's size and the output's address at the latest output pass, 0 until one is seen.
+    std::atomic<u32> input_width{};
+    std::atomic<u32> input_height{};
+    std::atomic<u64> output_address{};
     std::atomic<bool> output_replaced{}; ///< the latest output pass was replaced
     /// The prepass was skipped and no output pass has been replaced since.
     std::atomic<bool> output_pending{};
     /// The first native program dispatched after the network, 0 until one is seen.
     std::atomic<u64> after_network{};
 };
+
+/// Whether a B10G11R11 draw can hold the image the output pass shows: it has the size of the
+/// output pass's input and is not its output. The latest such draw before the output pass is the
+/// tonemap, whichever shader draws it, because it comes after the scene draws into the input.
+constexpr bool IsTonemapCandidate(u64 address, u32 width, u32 height, u32 input_width,
+                                  u32 input_height, u64 output_address) {
+    return address != 0 && address != output_address && input_width != 0 && input_height != 0 &&
+           width == input_width && height == input_height;
+}
 
 /// This program feeds only the bypassed network. Do not skip it outside its prepass window.
 inline bool ShouldSkipUnusedDispatch(u64 native_key, bool output_replaced, bool output_pending) {

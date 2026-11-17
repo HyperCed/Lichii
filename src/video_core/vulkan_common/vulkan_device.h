@@ -462,6 +462,7 @@ public:
     FN_MAX_LIMIT_ELEM(DescriptorSetSampledImages) \
     FN_MAX_LIMIT_ELEM(DescriptorSetStorageImages) \
     FN_MAX_LIMIT_ELEM(DescriptorSetInputAttachments) \
+    FN_MAX_LIMIT_ELEM(ImageDimension2D) \
     FN_MAX_LIMIT_ELEM(FramebufferWidth) \
     FN_MAX_LIMIT_ELEM(FramebufferHeight) \
     FN_MAX_LIMIT_ELEM(FramebufferLayers)
@@ -1106,6 +1107,12 @@ FN_MAX_LIMIT_LIST
         return has_renderdoc || has_nsight_graphics || has_radeon_gpu_profiler;
     }
 
+    /// Returns true when RADV saves a GPU hang report (RADV_DEBUG=hang), which keeps the SPIR-V of
+    /// the pipelines bound at the hang.
+    bool HasRadvHangReport() const {
+        return radv_hang_report;
+    }
+
     /// @returns True if compute pipelines can cause crashing.
     bool HasBrokenCompute() const {
         return has_broken_compute;
@@ -1469,6 +1476,7 @@ private:
     bool has_renderdoc{};                      ///< Has RenderDoc attached
     bool has_nsight_graphics{};                ///< Has Nsight Graphics attached
     bool has_radeon_gpu_profiler{};            ///< Has Radeon GPU Profiler attached.
+    bool radv_hang_report{};                   ///< RADV_DEBUG=hang is set.
     bool supports_d24_depth{};                 ///< Supports D24 depth buffers.
     bool must_emulate_scaled_formats{};        ///< Requires scaled vertex format emulation
     bool dynamic_state3_blending{};            ///< Has blending features of dynamic_state3.

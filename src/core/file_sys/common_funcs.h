@@ -3,7 +3,9 @@
 #pragma once
 
 #include <algorithm>
+#include <iterator>
 #include <span>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -89,6 +91,22 @@ constexpr u64 BASE_TITLE_ID_MASK = 0xFFFFFFFFFFFFE000;
                                    [base](u64 tid) { return GetBaseTitleID(tid) == base; });
     };
     return switch1 != own && !has_add_ons(own) && has_add_ons(switch1) ? switch1 : own;
+}
+
+/**
+ * Gets the add-ons that belong to a program, matched under GetAddOnApplicationID's base.
+ *
+ * @param program_id The program's title ID.
+ * @param add_on_content The add-on title IDs available.
+ * @returns The add-on title IDs of the program, in the given order.
+ */
+[[nodiscard]] inline std::vector<u64> GetAddOnContent(u64 program_id,
+                                                      std::span<const u64> add_on_content) {
+    const u64 base = GetAddOnApplicationID(program_id, add_on_content);
+    std::vector<u64> out;
+    std::ranges::copy_if(add_on_content, std::back_inserter(out),
+                         [base](u64 tid) { return GetBaseTitleID(tid) == base; });
+    return out;
 }
 
 } // namespace FileSys

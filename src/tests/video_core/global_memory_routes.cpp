@@ -138,8 +138,8 @@ TEST_CASE("A native access built from its own candidates is routed among them al
         SelectionsPerFunction(Backend::SPIRV::EmitSPIRV(profile, fixture.program))};
     // The functions through every buffer branch once per buffer, the routed 32-bit load and store
     // once per candidate
-    CHECK(std::ranges::count(selections, 3) >= 2);
-    CHECK(std::ranges::count(selections, 2) == 2);
+    CHECK(std::ranges::count(selections, size_t{3}) >= 2);
+    CHECK(std::ranges::count(selections, size_t{2}) == 2);
 }
 
 TEST_CASE("Selecting the buffer routes every access among all bound buffers",

@@ -5,9 +5,10 @@ Windows, then AMD FSR 3.1.6 if NVIDIA DLSS is disabled or unavailable. FSR uses 
 eight temporal-upscaling passes, including depth, motion, history and optional RCAS.
 This is separate from the presentation filters that scale the finished window image.
 
-Fire Emblem uses the jitter-only spatial workaround by default. Explicit `fsr` and `dlss`
-comparison modes enable temporal replacement for its validated input contract. The upstream
-temporal blend and RCAS fallback remain available if a temporal backend is unavailable.
+Fire Emblem uses temporal replacement by default: NVIDIA DLSS when it is on and available,
+then FSR 3.1 with the captured depth, then the upstream temporal blend and RCAS. A frame without
+matching motion vectors and depth, or one the temporal upscale turns down, is scaled with the
+jitter-only spatial workaround instead, never by the native pass.
 Invalid consumed inputs leave the native dispatch enabled. An already-rejected native
 tensor shader remains an explicit dispatch failure. General tensor emulation remains.
 
@@ -153,7 +154,8 @@ and makes later evaluations fall back; it does not wait for the scheduler worker
 
 `EDEN_NX2_DLSS_REPLACEMENT=fsr` selects temporal replacement and forces FSR for comparison.
 `dlss` selects temporal replacement with NVIDIA preferred when enabled and available.
-`native` preserves the guest evaluation. With no override, Fire Emblem uses spatial de-jitter.
+`native` preserves the guest evaluation. `spatial` keeps Fire Emblem on the spatial de-jitter for
+comparisons. With no override, Fire Emblem's replacement is temporal.
 The old `EDEN_NX2_DLSS_STANDIN` variable is not read. The internal `standin` backend override
 does not select Fire Emblem's intercepted dispatch. The RCAS sharpness setting controls FSR
 and fallback sharpening. NVIDIA model-selection overrides

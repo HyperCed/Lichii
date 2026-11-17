@@ -16,6 +16,8 @@
 #include "common/game_presets.h"
 #include "common/hex_util.h"
 #include "common/logging.h"
+#include "common/npln_patch_catalog.h"
+#include "common/npln_patch_manifest.h"
 #include "common/lz4_compression.h"
 #include "common/zbic_compression.h"
 #include "common/settings.h"
@@ -247,6 +249,18 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         pi_header = pm->PatchNSO(pi_header, name);
 
         std::copy(pi_header.begin() + sizeof(NSOHeader), pi_header.end(), patchable_section.data());
+    }
+
+    // The signed Nextendo patch fixed for this launch, applied after mods as citron-nextendo does.
+    static_assert(sizeof(NSOHeader) == Common::NplnPatchCatalog::NsoHeaderSize);
+    if (pm) {
+        const auto build_id = Common::HexToString(nso_header.build_id);
+        if (const auto applied = Common::NplnPatchCatalog::Apply(
+                pm->GetTitleID(), build_id, name,
+                std::span(codeset.memory).subspan(module_start))) {
+            LOG_INFO(Loader, "Nextendo: NPLN patch {} v{} applied to {} build {}", applied->id,
+                     applied->version, name, build_id);
+        }
     }
 
     // Mario Kart World selects a 1- or 2-vblank frame mode in its main loop. Force its native
@@ -544,6 +558,17 @@ AppLoader_NSO::LoadResult AppLoader_NSO::Load(Kernel::KProcess& process, Core::S
 
 ResultStatus AppLoader_NSO::ReadNSOModules(Modules& out_modules) {
     out_modules = this->modules;
+    return ResultStatus::Success;
+}
+
+ResultStatus AppLoader_NSO::ReadMainBuildId(Core::System& system,
+                                            std::array<u8, 0x20>& build_id) {
+    NSOHeader header{};
+    if (!file || file->ReadObject(&header) != sizeof(header) ||
+        header.magic != Common::MakeMagic('N', 'S', 'O', '0')) {
+        return ResultStatus::ErrorLoadingNSO;
+    }
+    build_id = header.build_id;
     return ResultStatus::Success;
 }
 

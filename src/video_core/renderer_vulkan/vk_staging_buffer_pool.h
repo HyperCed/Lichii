@@ -46,6 +46,10 @@ public:
 
     void TickFrame();
 
+    /// Out of device memory: waits for the submitted work without submitting, then frees every
+    /// staging buffer the GPU is done with. Those handed out since the last submit stay.
+    void ReleaseMemory();
+
     /// Bytes of the cached staging buffers of a kind, idle or in use (EDEN_NX2_MEM_TRACE).
     [[nodiscard]] u64 CachedBytes(MemoryUsage usage);
 

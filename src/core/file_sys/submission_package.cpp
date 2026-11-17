@@ -57,7 +57,9 @@ NSP::~NSP() = default;
 VirtualFile NSP::GetNCAFileById(const std::array<u8, 16>& id) const {
     std::scoped_lock lock{resolved_nca_files_mutex};
     if (const auto found = resolved_nca_files.find(id); found != resolved_nca_files.end()) {
-        // A solid NCZ reader that failed (disk full, decoder budget) stays failed: reopen it.
+        // A solid NCZ reader recovers from a full disk or decoder budget by itself, but isn't
+        // readable until then, and stays failed after corrupt data or a source that changed
+        // size: reopen it.
         if (found->second->IsReadable()) {
             return found->second;
         }
